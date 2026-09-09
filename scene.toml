@@ -1,0 +1,18 @@
+# Rustracer scene configuration
+# Override materials and add lights beyond what glTF provides.
+
+[environment]
+intensity = 1.5
+sky_zenith = [0.3, 0.5, 1.0]
+sky_horizon = [1.0, 0.95, 0.9]
+
+[[lights]]
+type = "point"
+position = [0.0, 3.0, 0.0]
+color = [1.0, 0.95, 0.8]
+intensity = 20.0
+
+# [[materials]]
+# index = 0
+# kind = "metal"
+# roughness = 0.2
