@@ -1,5 +1,7 @@
 # Rustracer
 
+<img width="800" height="630" alt="image" src="https://github.com/user-attachments/assets/ed0c0d82-06b3-46c1-b06a-72c018122755" />
+
 GPU-accelerated path tracer with photon mapping, written in Rust on wgpu.
 
 An interactive renderer: the image accumulates progressively on the GPU while you navigate the scene, and an egui panel gives live control over samples, exposure, tonemapping, the photon map and the denoiser.
