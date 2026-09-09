@@ -42,6 +42,30 @@ Development commands are in the `justfile` (`just check`, `just test`, `just val
 
 In development. Personal portfolio project; the renderer is my own implementation, from the BVH and material system to the photon map and denoise compute shaders.
 
+## Sample scenes
+
+Three glTF scenes from the Khronos glTF-Sample-Assets collection are set up for local testing. They are not committed to the repo; fetch them with:
+
+```bash
+python assets/scripts/download_sample_scenes.py
+```
+
+This downloads ToyCar (CC0, 109k triangles), DamagedHelmet (CC-BY 4.0, attribution in its LICENSE.md) and Lantern (CC0) into `assets/scenes/`.
+
+```bash
+cargo run --release -- assets/scenes/ToyCar/ToyCar.gltf
+cargo run --release -- assets/scenes/DamagedHelmet/DamagedHelmet.gltf
+cargo run --release -- assets/scenes/Lantern/Lantern.gltf
+```
+
+Headless loading check (no window):
+
+```bash
+cargo run -p rustracer-app --example loadcheck -- assets/scenes/ToyCar/ToyCar.gltf
+```
+
+Note on lighting: glTF punctual light extensions are not imported yet. Scenes without emissive materials render under the sky environment, and `scene.toml` point lights can be added for more direction.
+
 ## License
 
-MIT OR Apache-2.0. See [LICENSE](LICENSE).
+MIT OR Apache-2.0. See [LICENSE](LICENSE). Sample scene licenses live next to each scene under `assets/scenes/`.

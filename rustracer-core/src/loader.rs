@@ -67,7 +67,11 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
         let normal_tex: Option<usize> = mat.normal_texture()
             .map(|t: gltf::material::NormalTexture<'_>| t.texture().source().index());
 
-        let kind = if emissive.length() > 0.01 {
+        let kind = if emissive.length() > 0.01 && mat.emissive_texture().is_none() {
+            // Factor-based emissives become area lights. Textured emissives are
+            // skipped: the renderer cannot sample the emissive texture yet, and
+            // classifying the whole material as emissive would turn the entire
+            // mesh into a glowing area light.
             crate::material::MaterialKind::Emissive
         } else if metallic > 0.5 {
             crate::material::MaterialKind::Metal
