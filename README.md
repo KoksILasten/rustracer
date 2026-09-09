@@ -1,4 +1,4 @@
-# Rustracer
+# Rustracer - WIP
 
 <img width="800" height="630" alt="image" src="https://github.com/user-attachments/assets/ed0c0d82-06b3-46c1-b06a-72c018122755" />
 
