@@ -43,7 +43,7 @@ Development commands are in the `justfile` (`just check`, `just test`, `just val
 
 ## Status
 
-In development. Personal portfolio project; the renderer is my own implementation, from the BVH and material system to the photon map and denoise compute shaders.
+In development! Personal portfolio project. I implemented the renderer from the BVH and material system to the photon map and denoise compute shaders.
 
 ## Sample scenes
 
