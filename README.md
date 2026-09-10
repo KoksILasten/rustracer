@@ -61,14 +61,6 @@ cargo run --release -- assets/scenes/DamagedHelmet/DamagedHelmet.gltf
 cargo run --release -- assets/scenes/Lantern/Lantern.gltf
 ```
 
-Headless loading check (no window):
-
-```bash
-cargo run -p rustracer-app --example loadcheck -- assets/scenes/ToyCar/ToyCar.gltf
-```
-
-Note on lighting: glTF punctual light extensions are not imported yet. Scenes without emissive materials render under the sky environment, and `scene.toml` point lights can be added for more direction.
-
 ## License
 
 MIT OR Apache-2.0. See [LICENSE](LICENSE). Sample scene licenses live next to each scene under `assets/scenes/`.
