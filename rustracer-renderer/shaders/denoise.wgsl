@@ -1,8 +1,8 @@
 // Multi-iteration A-Trous edge-avoiding wavelet denoiser (SVGF-style).
 // Edge stopping uses normal angle, depth difference, AND color variance.
-// Called once per iteration with increasing step sizes (1,2,4,8,16).
+// Called once per iteration with increasing step sizes (1,2,4,8).
 
-@group(0) @binding(0) var<storage, read_write> accumulation: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> frame: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> gbuffer: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> params: DenoiseParams;
 
@@ -32,8 +32,17 @@ fn depth_weight(dc: f32, dn: f32) -> f32 {
 }
 
 fn color_weight(a: vec3<f32>, b: vec3<f32>) -> f32 {
-    let lum_diff = abs(dot(a - b, vec3(0.2126, 0.7152, 0.0722)));
-    return exp(-lum_diff / params.phi_color);
+    let lum_w = vec3(0.2126, 0.7152, 0.0722);
+    let lum_a = dot(a, lum_w);
+    let lum_b = dot(b, lum_w);
+    let lum_diff = abs(lum_a - lum_b);
+    // Luma-relative threshold (SVGF-style) with an absolute floor and a
+    // Gaussian falloff. Bright-vs-dark edges (emissive HUD decal on glass)
+    // get a huge ratio → weight ≈ 0 → hard stop, while flat-region noise
+    // stays under the 0.15 floor → still smooths even in dark areas.
+    let scale = max(params.phi_color * max(lum_a, lum_b), 0.15);
+    let r = lum_diff / scale;
+    return exp(-r * r);
 }
 
 @compute @workgroup_size(8, 8)
@@ -43,7 +52,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let step = i32(params.step_size);
     let idx = pixel.y * params.width + pixel.x;
-    let center = accumulation[idx].rgb;
+    let center = frame[idx].rgb;
     let n_center = gbuffer[idx].xyz;
     let d_center = gbuffer[idx].w;
 
@@ -58,7 +67,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             if nx < 0 || ny < 0 || nx >= i32(params.width) || ny >= i32(params.height) { continue; }
 
             let nidx = u32(ny) * params.width + u32(nx);
-            let neighbor = accumulation[nidx].rgb;
+            let neighbor = frame[nidx].rgb;
             let n_neighbor = gbuffer[nidx].xyz;
             let d_neighbor = gbuffer[nidx].w;
 
@@ -74,5 +83,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let filtered = sum / total_weight;
-    accumulation[idx] = vec4(filtered, accumulation[idx].a);
+    frame[idx] = vec4(filtered, frame[idx].a);
 }

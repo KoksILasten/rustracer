@@ -80,6 +80,10 @@ pub struct ToneMapUniform { pub exposure: f32, pub gamma: f32, pub sample_count:
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DenoiseParamsUniform { pub width: u32, pub height: u32, pub step_size: u32, pub phi_color: f32, pub phi_normal: f32, pub phi_depth: f32, pub _pad: [u32; 2] }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CompositeParams { pub width: u32, pub height: u32, pub alpha: f32, pub _pad: u32 }
+
 /// Uniform grid over the scene for photon lookup.
 /// All scalar fields (4-byte aligned) to match WGSL exactly.
 #[repr(C)]
@@ -102,11 +106,13 @@ pub struct GpuBuffers {
     pub camera:       buffer::UniformBuffer<CameraUniform>,
     pub photons:      buffer::TypedBuffer<PhotonGpu>,
     pub accumulation: buffer::TypedBuffer<[f32; 4]>,
+    pub frame:        buffer::TypedBuffer<[f32; 4]>, // raw frame; denoise works here, never on accumulation
     pub gbuffer:      buffer::TypedBuffer<[f32; 4]>, // normal.xyz + depth.w
     pub sample_count: buffer::UniformBuffer<SampleCountUniform>,
     pub tonemap_params: buffer::UniformBuffer<ToneMapUniform>,
     pub img_params:   buffer::UniformBuffer<ImageParams>,
     pub denoise_params: buffer::UniformBuffer<DenoiseParamsUniform>,
+    pub composite_params: buffer::UniformBuffer<CompositeParams>,
     pub grid_params:   buffer::UniformBuffer<GridParamsUniform>,
     pub grid_counts:   buffer::TypedBuffer<u32>,
     pub grid_meta:     buffer::TypedBuffer<[u32; 2]>, // [start, count] per cell
@@ -148,6 +154,8 @@ pub struct Renderer {
     tonemap_bgl: wgpu::BindGroupLayout,
     denoise_pipeline: wgpu::ComputePipeline,
     denoise_bgl: wgpu::BindGroupLayout,
+    composite_pipeline: wgpu::ComputePipeline,
+    composite_bgl: wgpu::BindGroupLayout,
     quad_bgl: wgpu::BindGroupLayout,
     quad_sampler: wgpu::Sampler,
 }
@@ -168,11 +176,13 @@ impl Renderer {
         let num_pixels = (config.width * config.height) as u64;
         let photons = buffer::TypedBuffer::new_zeroed(&device, "photons", config.photon_count as u64 * config.max_bounces as u64, wgpu::BufferUsages::STORAGE);
         let accumulation = buffer::TypedBuffer::new_zeroed(&device, "accumulation", num_pixels, wgpu::BufferUsages::STORAGE);
+        let frame = buffer::TypedBuffer::new_zeroed(&device, "frame", num_pixels, wgpu::BufferUsages::STORAGE);
         let gbuffer = buffer::TypedBuffer::new_zeroed(&device, "gbuffer", num_pixels, wgpu::BufferUsages::STORAGE);
         let sample_count = buffer::UniformBuffer::new(&device, "sample_count", &SampleCountUniform { count: 0, _pad: [0; 3] });
         let tonemap_params = buffer::UniformBuffer::new(&device, "tonemap_params", &ToneMapUniform { exposure: 1.0, gamma: 2.2, sample_count: 0, width: config.width });
         let img_params = buffer::UniformBuffer::new(&device, "img_params", &ImageParams { width: config.width, height: config.height, spp: config.spp, frame: 0, light_emission: config.light_emission, ambient: config.ambient, accumulate_alpha: 0.0, use_photons: if config.enable_photon_map { 1 } else { 0 }, photon_count: config.photon_count, photon_radius: config.photon_radius, photon_scale: config.photon_scale, photon_debug: if config.photon_debug { 1 } else { 0 }, point_light_emission: config.point_light_emission, _pad: [config.debug_view, 0, 0] });
-        let denoise_params = buffer::UniformBuffer::new(&device, "denoise_params", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, phi_color: 0.35, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] });
+        let denoise_params = buffer::UniformBuffer::new(&device, "denoise_params", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] });
+        let composite_params = buffer::UniformBuffer::new(&device, "composite_params", &CompositeParams { width: config.width, height: config.height, alpha: 1.0, _pad: 0 });
         // Per-scene photon grid: cover the scene bounds with a cell size
         // that fits the longest axis into GRID_MAX_DIM cells.
         let (bmin, bmax) = scene.bounds().unwrap_or((glam::Vec3::splat(-1.05), glam::Vec3::splat(1.05)));
@@ -234,7 +244,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, gbuffer, sample_count, tonemap_params, img_params, denoise_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, tex_albedo, tex_albedo_view, tex_mr, tex_mr_view, tex_emissive, tex_emissive_view, tex_normal, tex_normal_view, tex_sampler, output_texture, output_view };
+        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, frame, gbuffer, sample_count, tonemap_params, img_params, denoise_params, composite_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, tex_albedo, tex_albedo_view, tex_mr, tex_mr_view, tex_emissive, tex_emissive_view, tex_normal, tex_normal_view, tex_sampler, output_texture, output_view };
 
         // Sampler for fullscreen quad
         let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -253,9 +263,10 @@ impl Renderer {
         let (gather_pipeline, gather_bgl) = pipeline::create_gather_pipeline(&device, &shaders, &buffers);
         let (tonemap_pipeline, tonemap_bgl) = pipeline::create_tonemap_pipeline(&device, &shaders, &buffers);
         let (denoise_pipeline, denoise_bgl) = pipeline::create_denoise_pipeline(&device, &shaders);
+        let (composite_pipeline, composite_bgl) = pipeline::create_composite_pipeline(&device, &shaders);
         let (quad_pipeline, quad_bgl) = pipeline::create_quad_pipeline(&device, &shaders);
 
-        Ok(Self { device, queue, config, buffers, sample_counter: 0, first_frame_after_reset: true, photons_dirty: true, photon_trace_pipeline, photon_count_pipeline, photon_scatter_pipeline, gather_pipeline, tonemap_pipeline, denoise_pipeline, quad_pipeline, photon_trace_bgl, photon_count_bgl, photon_scatter_bgl, gather_bgl, tonemap_bgl, denoise_bgl, quad_bgl, quad_sampler })
+        Ok(Self { device, queue, config, buffers, sample_counter: 0, first_frame_after_reset: true, photons_dirty: true, photon_trace_pipeline, photon_count_pipeline, photon_scatter_pipeline, gather_pipeline, tonemap_pipeline, denoise_pipeline, composite_pipeline, quad_pipeline, photon_trace_bgl, photon_count_bgl, photon_scatter_bgl, gather_bgl, tonemap_bgl, denoise_bgl, composite_bgl, quad_bgl, quad_sampler })
     }
 
     /// Record all rendering commands into the encoder. No queue.write_buffer calls.
@@ -299,24 +310,42 @@ impl Renderer {
             pass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
         }
 
-        // Pass 2: Denoise (5 A-Trous iterations with increasing step sizes)
+        // Pass 2: Denoise (5 A-Trous iterations with increasing step sizes).
+        // Operates on the FRESH frame buffer only — filtering the EMA
+        // accumulation history instead would compound smoothing frame over
+        // frame (the "image stacked on top of itself" ghosting artifact).
         if self.config.enable_denoise {
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("denoise_bg"), layout: &self.denoise_bgl, entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.buffers.accumulation.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: self.buffers.frame.buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.buffers.gbuffer.buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.buffers.denoise_params.buffer().as_entire_binding() },
             ]});
-            for iter in 0..5u32 {
+            for iter in 0..4u32 {
                 let step = 1u32 << iter;
                 self.buffers.denoise_params.write(&self.queue, &DenoiseParamsUniform {
                     width: self.config.width, height: self.config.height,
-                    step_size: step, phi_color: 0.35, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2],
+                    step_size: step, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2],
                 });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("denoise"), timestamp_writes: None });
                 pass.set_pipeline(&self.denoise_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
             }
+        }
+
+        // Pass 2.5: Composite the fresh (denoised) frame into the EMA
+        // accumulation history (alpha from above: 1.0 → overwrite).
+        {
+            self.buffers.composite_params.write(&self.queue, &CompositeParams { width: self.config.width, height: self.config.height, alpha, _pad: 0 });
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("composite_bg"), layout: &self.composite_bgl, entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.buffers.frame.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.buffers.accumulation.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.buffers.composite_params.buffer().as_entire_binding() },
+            ]});
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("composite"), timestamp_writes: None });
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
         }
 
         // Pass 3: Tonemap → storage texture
@@ -467,7 +496,7 @@ impl GpuBuffers {
     fn gather_entries(&self) -> [wgpu::BindGroupEntry<'_>; 17] {
         [
             wgpu::BindGroupEntry { binding: 0, resource: self.sorted_photons.buffer().as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: self.accumulation.buffer().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: self.frame.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: self.camera.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: self.bvh_nodes.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: self.bvh_prims.buffer().as_entire_binding() },

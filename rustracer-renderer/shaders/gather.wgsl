@@ -8,7 +8,7 @@
 #include common.wgsl
 
 @group(0) @binding(0) var<storage, read> sorted_photons: array<Photon>;
-@group(0) @binding(1) var<storage, read_write> accumulation: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> frame: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> camera: Camera;
 @group(0) @binding(3) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(0) @binding(4) var<storage, read> bvh_prims: array<u32>;
@@ -436,8 +436,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // edge-stopping deliberately keeps high-contrast pixels).
     col = min(col / f32(spp), vec3(10.0));
     let idx = pixel.y * img_params.width + pixel.x;
-    let prev = accumulation[idx];
-    accumulation[idx] = mix(prev, vec4(col, 1.0), img_params.accumulate_alpha);
+    // The raw sample goes to the frame buffer; the composite pass blends it
+    // into the EMA accumulation history (denoise runs on `frame`, never on
+    // the history buffer itself — that would re-filter the running average).
+    frame[idx] = vec4(col, 1.0);
     // Write GBuffer (denoiser guidance): normal.xyz + depth.w
     gbuffer[idx] = vec4(first_normal, first_depth);
 }

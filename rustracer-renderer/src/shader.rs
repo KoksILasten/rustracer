@@ -13,6 +13,7 @@ pub struct ShaderBundle {
     pub gather: ShaderModule,
     pub tonemap: ShaderModule,
     pub denoise: ShaderModule,
+    pub composite: ShaderModule,
     pub fullscreen: ShaderModule,
 }
 
@@ -40,6 +41,7 @@ impl ShaderBundle {
             )),
             tonemap: Self::compile(device, "tonemap", include_str!("../shaders/tonemap.wgsl")),
             denoise: Self::compile(device, "denoise", include_str!("../shaders/denoise.wgsl")),
+            composite: Self::compile(device, "composite", include_str!("../shaders/composite.wgsl")),
             fullscreen: Self::compile(device, "fullscreen", include_str!("../shaders/fullscreen.wgsl")),
         })
     }

@@ -111,6 +111,23 @@ pub fn create_tonemap_pipeline(
     (pipeline, bgl)
 }
 
+pub fn create_composite_pipeline(
+    device: &wgpu::Device, shaders: &ShaderBundle,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_bgl"),
+        entries: &[storage_buffer_binding(0, false), storage_buffer_binding(1, true), uniform_buffer_binding(2)],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("composite_layout"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("composite"), layout: Some(&layout), module: &shaders.composite,
+        entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+    });
+    (pipeline, bgl)
+}
+
 pub fn create_denoise_pipeline(
     device: &wgpu::Device, shaders: &ShaderBundle,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
