@@ -147,13 +147,86 @@ struct Camera {
     focus_dist: f32,
 }
 
+// ── Material constants (mirror rustracer-core) ──
+
+const TEX_NONE: u32 = 0xFFFFFFFFu;
+const MAT_FLAG_ALPHA_CUTOUT: u32 = 1u;
+
 struct Material {
-    albedo: vec4<f32>,
-    emissive: vec3<f32>,
-    roughness: f32,
-    metallic: f32,
-    ior: f32,
-    kind: u32,
+    albedo: vec4<f32>,      // base color (linear) + alpha
+    emissive: vec3<f32>,    // emission factor color
+    roughness: f32,         // GGX roughness (0 = mirror, 1 = diffuse)
+    metallic: f32,          // metalness (0 = dielectric, 1 = metal)
+    ior: f32,               // index of refraction for dielectrics
+    kind: u32,              // MaterialKind discriminant
+    flags: u32,             // MAT_FLAG_* bits
+    tex_albedo: u32,        // layer in the albedo texture array
+    tex_mr: u32,            // layer in the metallic-roughness array
+    tex_emissive: u32,      // layer in the emissive array
+    tex_normal: u32,        // layer in the normal-map array
+}
+
+// ── Tangent frame from triangle UV gradients (no stored tangents) ──
+
+struct Bary {
+    uv: vec2<f32>,
+    u: f32, // weight of v1
+    v: f32, // weight of v2
+}
+
+// Barycentric coordinates + interpolated UV of a hit point on a triangle.
+fn barycentric(tri: Triangle, ro: vec3<f32>, rd: vec3<f32>, t: f32) -> Bary {
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+    let p = ro + rd * t - tri.v0;
+    let d00 = dot(e1, e1); let d01 = dot(e1, e2); let d11 = dot(e2, e2);
+    let d20 = dot(p, e1); let d21 = dot(p, e2);
+    let denom = d00 * d11 - d01 * d01;
+    var u: f32 = 0.0; var v: f32 = 0.0;
+    if denom != 0.0 {
+        u = (d11 * d20 - d01 * d21) / denom;
+        v = (d00 * d21 - d01 * d20) / denom;
+    }
+    let w = 1.0 - u - v;
+    return Bary(tri.uv0 * w + tri.uv1 * u + tri.uv2 * v, u, v);
+}
+
+// Smooth interpolated vertex normal at a hit point (falls back to the flat
+// geometric normal for degenerate normals).
+fn smooth_normal(tri: Triangle, b: Bary, geometric: vec3<f32>) -> vec3<f32> {
+    let w = 1.0 - b.u - b.v;
+    var n = tri.n0 * w + tri.n1 * b.u + tri.n2 * b.v;
+    if dot(n, n) < 1e-8 { return geometric; }
+    return normalize(n);
+}
+
+struct TanFrame {
+    t: vec3<f32>,
+    b: vec3<f32>,
+}
+
+// dp/du, dp/dv from the triangle edges; Gram-Schmidt against the shading
+// normal and fix handedness. Fall back to an arbitrary perpendicular when
+// the UVs are degenerate.
+fn tangent_frame(tri: Triangle, n: vec3<f32>) -> TanFrame {
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+    let d1 = tri.uv1 - tri.uv0;
+    let d2 = tri.uv2 - tri.uv0;
+    let det = d1.x * d2.y - d2.x * d1.y;
+    let f = select(1.0 / det, 0.0, abs(det) < 1e-12);
+    let t = (e1 * d2.y - e2 * d1.y) * f;
+    let b = (e2 * d1.x - e1 * d2.x) * f;
+    var tt = t - n * dot(n, t);
+    if dot(tt, tt) < 1e-10 {
+        tt = cross(n, vec3(1.0, 0.0, 0.0));
+        if dot(tt, tt) < 1e-6 {
+            tt = cross(n, vec3(0.0, 1.0, 0.0));
+        }
+    }
+    tt = normalize(tt);
+    let bb = cross(n, tt) * select(-1.0, 1.0, dot(cross(n, tt), b) > 0.0);
+    return TanFrame(tt, bb);
 }
 
 struct Light {

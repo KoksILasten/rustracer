@@ -11,6 +11,13 @@ fn main() -> anyhow::Result<()> {
     println!("  meshes: {}", scene.meshes.len());
     println!("  materials: {}", scene.materials.len());
     println!("  textures: {}", scene.textures.len());
+    println!(
+        "  texture roles (albedo/mr/emissive/normal): {}/{}/{}/{}",
+        scene.tex_albedo.len(),
+        scene.tex_mr.len(),
+        scene.tex_emissive.len(),
+        scene.tex_normal.len()
+    );
     let tris: usize = scene.meshes.iter().map(|m| m.triangle_count()).sum();
     println!("  triangles: {}", tris);
     let area = scene.lights.iter().filter(|l| matches!(l, rustracer_core::scene::Light::Area { .. })).count();

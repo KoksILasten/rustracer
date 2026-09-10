@@ -13,3 +13,7 @@ bytemuck.workspace = true
 glam.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in"] }
+pollster.workspace = true

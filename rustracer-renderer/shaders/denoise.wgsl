@@ -26,7 +26,9 @@ fn normal_weight(nc: vec3<f32>, nn: vec3<f32>) -> f32 {
 }
 
 fn depth_weight(dc: f32, dn: f32) -> f32 {
-    return exp(-abs(dc - dn) / params.phi_depth);
+    // Relative depth difference: scale the threshold by the distance of the
+    // center pixel so the same settings work for any scene scale.
+    return exp(-abs(dc - dn) / (params.phi_depth * max(dc, 1e-4)));
 }
 
 fn color_weight(a: vec3<f32>, b: vec3<f32>) -> f32 {

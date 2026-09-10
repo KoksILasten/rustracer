@@ -12,7 +12,7 @@ pub async fn create_device(
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 256 * 1024 * 1024,
                     max_buffer_size: 512 * 1024 * 1024,
-                    max_storage_buffers_per_shader_stage: 8,
+                    max_storage_buffers_per_shader_stage: 16,
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

@@ -8,11 +8,12 @@ pub mod shader;
 use rustracer_core::camera::CameraUniform;
 use rustracer_core::scene::Scene;
 
-// Photon grid over the scene volume (room is ~[-1.05, 1.05]^2 x [-1.05, 2.05])
-const GRID_CELL_SIZE: f32 = 0.2;
-const GRID_MIN: [f32; 3] = [-1.05, -1.05, -1.05];
-const GRID_DIM: [u32; 3] = [11, 16, 11]; // ceil(2.1/0.2), ceil(3.1/0.2), ceil(2.1/0.2)
-const GRID_NUM_CELLS: u32 = 11 * 16 * 11;
+// Photon grid over the scene volume. The grid is sized from the scene's
+// world-space bounds at renderer creation (cell size auto-scaled so the
+// longest axis fits GRID_MAX_DIM cells); buffers are allocated for the
+// worst case so per-scene dims only live in the GridParams uniform.
+const GRID_MAX_DIM: u32 = 26;
+const GRID_MAX_CELLS: u32 = 26 * 26 * 26;
 
 #[derive(Debug, Clone)]
 pub struct RenderConfig {
@@ -27,7 +28,13 @@ pub struct RenderConfig {
     pub enable_photon_map: bool,
     pub enable_denoise: bool,
     pub photon_debug: bool,
+    /// Debug view (0 = normal render; 1 = UVs, 2 = smooth normal,
+    /// 3 = perturbed normal, 4 = flat normal).
+    pub debug_view: u32,
     pub photon_scale: f32,
+    /// Photon lookup radius; auto-scaled from the scene's grid cell size
+    /// at renderer creation.
+    pub photon_radius: f32,
     pub ambient: f32,
 }
 impl Default for RenderConfig {
@@ -42,7 +49,9 @@ impl Default for RenderConfig {
             enable_photon_map: false,
             enable_denoise: true,
             photon_debug: false,
-            photon_scale: 0.005,
+            debug_view: 0,
+            photon_scale: 0.02,
+            photon_radius: 0.5,
             ambient: 0.03,
         }
     }
@@ -103,6 +112,16 @@ pub struct GpuBuffers {
     pub grid_meta:     buffer::TypedBuffer<[u32; 2]>, // [start, count] per cell
     pub grid_cursor:   buffer::TypedBuffer<u32>,
     pub sorted_photons: buffer::TypedBuffer<PhotonGpu>,
+    // Role texture arrays (uniform sizes; see rustracer-core::loader).
+    pub tex_albedo: wgpu::Texture,
+    pub tex_albedo_view: wgpu::TextureView,
+    pub tex_mr: wgpu::Texture,
+    pub tex_mr_view: wgpu::TextureView,
+    pub tex_emissive: wgpu::Texture,
+    pub tex_emissive_view: wgpu::TextureView,
+    pub tex_normal: wgpu::Texture,
+    pub tex_normal_view: wgpu::TextureView,
+    pub tex_sampler: wgpu::Sampler,
     // Output is a storage texture (written by tonemap pass)
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -134,7 +153,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(adapter: &wgpu::Adapter, config: RenderConfig, scene: &Scene) -> anyhow::Result<Self> {
+    pub async fn new(adapter: &wgpu::Adapter, mut config: RenderConfig, scene: &Scene) -> anyhow::Result<Self> {
         let (device, queue) = device::create_device(adapter).await?;
 
         let triangles = buffer::TypedBuffer::from_slice(&device, "triangles", &scene.flatten_triangles(), wgpu::BufferUsages::STORAGE);
@@ -152,20 +171,38 @@ impl Renderer {
         let gbuffer = buffer::TypedBuffer::new_zeroed(&device, "gbuffer", num_pixels, wgpu::BufferUsages::STORAGE);
         let sample_count = buffer::UniformBuffer::new(&device, "sample_count", &SampleCountUniform { count: 0, _pad: [0; 3] });
         let tonemap_params = buffer::UniformBuffer::new(&device, "tonemap_params", &ToneMapUniform { exposure: 1.0, gamma: 2.2, sample_count: 0, width: config.width });
-        let img_params = buffer::UniformBuffer::new(&device, "img_params", &ImageParams { width: config.width, height: config.height, spp: config.spp, frame: 0, light_emission: config.light_emission, ambient: config.ambient, accumulate_alpha: 0.0, use_photons: if config.enable_photon_map { 1 } else { 0 }, photon_count: config.photon_count, photon_radius: 0.5, photon_scale: 0.005, photon_debug: if config.photon_debug { 1 } else { 0 }, point_light_emission: config.point_light_emission, _pad: [0; 3] });
-        let denoise_params = buffer::UniformBuffer::new(&device, "denoise_params", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, phi_color: 0.3, phi_normal: 32.0, phi_depth: 0.05, _pad: [0; 2] });
+        let img_params = buffer::UniformBuffer::new(&device, "img_params", &ImageParams { width: config.width, height: config.height, spp: config.spp, frame: 0, light_emission: config.light_emission, ambient: config.ambient, accumulate_alpha: 0.0, use_photons: if config.enable_photon_map { 1 } else { 0 }, photon_count: config.photon_count, photon_radius: config.photon_radius, photon_scale: config.photon_scale, photon_debug: if config.photon_debug { 1 } else { 0 }, point_light_emission: config.point_light_emission, _pad: [config.debug_view, 0, 0] });
+        let denoise_params = buffer::UniformBuffer::new(&device, "denoise_params", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, phi_color: 0.35, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] });
+        // Per-scene photon grid: cover the scene bounds with a cell size
+        // that fits the longest axis into GRID_MAX_DIM cells.
+        let (bmin, bmax) = scene.bounds().unwrap_or((glam::Vec3::splat(-1.05), glam::Vec3::splat(1.05)));
+        let ext = bmax - bmin;
+        let max_ext = ext.max_element().max(1e-3);
+        let cell_size = max_ext / (GRID_MAX_DIM as f32 - 2.0);
+        let dim = |e: f32| ((e / cell_size).ceil() as u32).clamp(1, GRID_MAX_DIM);
+        let grid_x = dim(ext.x);
+        let grid_y = dim(ext.y);
+        let grid_z = dim(ext.z);
+        let num_cells = grid_x * grid_y * grid_z;
+        let room_min = bmin - glam::Vec3::splat(cell_size * 0.5);
+        // Photon lookup radius scales with the scene: a few cells wide.
+        config.photon_radius = (cell_size * 4.0).clamp(0.01, 2.0);
+        tracing::info!(
+            "Photon grid {}x{}x{} = {} cells, cell {:.4}, radius {:.4}, origin {:?}",
+            grid_x, grid_y, grid_z, num_cells, cell_size, config.photon_radius, room_min
+        );
         let grid_params = buffer::UniformBuffer::new(&device, "grid_params", &GridParamsUniform {
-            room_min_x: GRID_MIN[0], room_min_y: GRID_MIN[1], room_min_z: GRID_MIN[2],
-            cell_size: GRID_CELL_SIZE,
-            grid_x: GRID_DIM[0], grid_y: GRID_DIM[1], grid_z: GRID_DIM[2],
-            num_cells: GRID_NUM_CELLS,
+            room_min_x: room_min.x, room_min_y: room_min.y, room_min_z: room_min.z,
+            cell_size,
+            grid_x, grid_y, grid_z,
+            num_cells,
             photon_slots: config.photon_count * config.max_bounces,
             _pad: [0; 3],
         });
         let max_stored = (config.photon_count * config.max_bounces) as u64;
-        let grid_counts = buffer::TypedBuffer::new_zeroed(&device, "grid_counts", GRID_NUM_CELLS as u64, wgpu::BufferUsages::STORAGE);
-        let grid_meta = buffer::TypedBuffer::new_zeroed(&device, "grid_meta", GRID_NUM_CELLS as u64, wgpu::BufferUsages::STORAGE);
-        let grid_cursor = buffer::TypedBuffer::new_zeroed(&device, "grid_cursor", GRID_NUM_CELLS as u64, wgpu::BufferUsages::STORAGE);
+        let grid_counts = buffer::TypedBuffer::new_zeroed(&device, "grid_counts", GRID_MAX_CELLS as u64, wgpu::BufferUsages::STORAGE);
+        let grid_meta = buffer::TypedBuffer::new_zeroed(&device, "grid_meta", GRID_MAX_CELLS as u64, wgpu::BufferUsages::STORAGE);
+        let grid_cursor = buffer::TypedBuffer::new_zeroed(&device, "grid_cursor", GRID_MAX_CELLS as u64, wgpu::BufferUsages::STORAGE);
         let sorted_photons = buffer::TypedBuffer::new_zeroed(&device, "sorted_photons", max_stored, wgpu::BufferUsages::STORAGE);
 
         // Storage texture for tonemap output
@@ -181,7 +218,23 @@ impl Renderer {
         });
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, gbuffer, sample_count, tonemap_params, img_params, denoise_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, output_texture, output_view };
+        // Role texture arrays + shared sampler for material sampling.
+        let (tex_albedo, tex_albedo_view) = create_role_array(&device, &queue, "tex_albedo", &scene.tex_albedo);
+        let (tex_mr, tex_mr_view) = create_role_array(&device, &queue, "tex_mr", &scene.tex_mr);
+        let (tex_emissive, tex_emissive_view) = create_role_array(&device, &queue, "tex_emissive", &scene.tex_emissive);
+        let (tex_normal, tex_normal_view) = create_role_array(&device, &queue, "tex_normal", &scene.tex_normal);
+        let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, gbuffer, sample_count, tonemap_params, img_params, denoise_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, tex_albedo, tex_albedo_view, tex_mr, tex_mr_view, tex_emissive, tex_emissive_view, tex_normal, tex_normal_view, tex_sampler, output_texture, output_view };
 
         // Sampler for fullscreen quad
         let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -222,11 +275,11 @@ impl Renderer {
             accumulate_alpha: alpha,
             use_photons: if self.config.enable_photon_map { 1 } else { 0 },
             photon_count: self.config.photon_count,
-            photon_radius: 0.5,
+            photon_radius: self.config.photon_radius,
             photon_scale: self.config.photon_scale,
             photon_debug: if self.config.photon_debug { 1 } else { 0 },
             point_light_emission: self.config.point_light_emission,
-            _pad: [0; 3],
+            _pad: [self.config.debug_view, 0, 0],
         });
         self.buffers.tonemap_params.write(&self.queue, &ToneMapUniform {
             exposure: self.config.exposure,
@@ -257,7 +310,7 @@ impl Renderer {
                 let step = 1u32 << iter;
                 self.buffers.denoise_params.write(&self.queue, &DenoiseParamsUniform {
                     width: self.config.width, height: self.config.height,
-                    step_size: step, phi_color: 0.25, phi_normal: 32.0, phi_depth: 0.05, _pad: [0; 2],
+                    step_size: step, phi_color: 0.35, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2],
                 });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("denoise"), timestamp_writes: None });
                 pass.set_pipeline(&self.denoise_pipeline);
@@ -341,12 +394,12 @@ impl Renderer {
         // Read back grid_counts, compute prefix sums (CPU, rare operation)
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("grid_counts_staging"),
-            size: GRID_NUM_CELLS as u64 * 4,
+            size: GRID_MAX_CELLS as u64 * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("photon_readback") });
-        encoder.copy_buffer_to_buffer(self.buffers.grid_counts.buffer(), 0, &staging, 0, GRID_NUM_CELLS as u64 * 4);
+        encoder.copy_buffer_to_buffer(self.buffers.grid_counts.buffer(), 0, &staging, 0, GRID_MAX_CELLS as u64 * 4);
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
@@ -356,13 +409,13 @@ impl Renderer {
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().map_err(|_| anyhow::anyhow!("grid readback failed"))??;
 
-        let mut starts = vec![0u32; GRID_NUM_CELLS as usize];
-        let mut counts_vec = vec![0u32; GRID_NUM_CELLS as usize];
+        let mut starts = vec![0u32; GRID_MAX_CELLS as usize];
+        let mut counts_vec = vec![0u32; GRID_MAX_CELLS as usize];
         {
             let data = slice.get_mapped_range();
             let counts: &[u32] = bytemuck::cast_slice(&data);
             let mut acc = 0u32;
-            for i in 0..GRID_NUM_CELLS as usize {
+            for i in 0..GRID_MAX_CELLS as usize {
                 starts[i] = acc;
                 counts_vec[i] = counts[i];
                 acc += counts[i];
@@ -370,11 +423,11 @@ impl Renderer {
         }
 
         // Write grid_meta as [start, count] pairs, zero cursor, then scatter
-        let meta: Vec<[u32; 2]> = (0..GRID_NUM_CELLS as usize)
+        let meta: Vec<[u32; 2]> = (0..GRID_MAX_CELLS as usize)
             .map(|i| [starts[i], counts_vec[i]])
             .collect();
         self.buffers.grid_meta.write(&self.queue, &meta);
-        self.buffers.grid_cursor.write(&self.queue, &vec![0u32; GRID_NUM_CELLS as usize]);
+        self.buffers.grid_cursor.write(&self.queue, &vec![0u32; GRID_MAX_CELLS as usize]);
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("photon_rebuild_b") });
             let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("scatter_bg"), layout: &self.photon_scatter_bgl, entries: &self.buffers.photon_scatter_entries() });
@@ -388,7 +441,7 @@ impl Renderer {
         }
 
         self.photons_dirty = false;
-        tracing::info!("Photon map rebuilt: {} photons, {} cells", num_photons, GRID_NUM_CELLS);
+        tracing::info!("Photon map rebuilt: {} photons, {} cells", num_photons, GRID_MAX_CELLS);
         Ok(())
     }
 
@@ -396,7 +449,7 @@ impl Renderer {
 }
 
 impl GpuBuffers {
-    fn photon_trace_entries(&self) -> [wgpu::BindGroupEntry<'_>; 6] {
+    fn photon_trace_entries(&self) -> [wgpu::BindGroupEntry<'_>; 10] {
         [
             wgpu::BindGroupEntry { binding: 0, resource: self.photons.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: self.bvh_nodes.buffer().as_entire_binding() },
@@ -404,10 +457,14 @@ impl GpuBuffers {
             wgpu::BindGroupEntry { binding: 3, resource: self.triangles.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: self.lights.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: self.materials.buffer().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.tex_albedo_view) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.tex_sampler) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.tex_normal_view) },
+            wgpu::BindGroupEntry { binding: 9, resource: self.grid_params.buffer().as_entire_binding() },
         ]
     }
 
-    fn gather_entries(&self) -> [wgpu::BindGroupEntry<'_>; 11] {
+    fn gather_entries(&self) -> [wgpu::BindGroupEntry<'_>; 17] {
         [
             wgpu::BindGroupEntry { binding: 0, resource: self.sorted_photons.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: self.accumulation.buffer().as_entire_binding() },
@@ -420,6 +477,12 @@ impl GpuBuffers {
             wgpu::BindGroupEntry { binding: 8, resource: self.gbuffer.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: self.grid_meta.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: self.grid_params.buffer().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: self.lights.buffer().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&self.tex_albedo_view) },
+            wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.tex_mr_view) },
+            wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&self.tex_emissive_view) },
+            wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(&self.tex_sampler) },
+            wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&self.tex_normal_view) },
         ]
     }
 
@@ -453,12 +516,72 @@ impl GpuBuffers {
 fn light_to_gpu(light: &rustracer_core::scene::Light) -> rustracer_core::scene::LightGpu {
     match light {
         rustracer_core::scene::Light::Point { position, color, intensity } =>
-            rustracer_core::scene::LightGpu { data: [position.x, position.y, position.z, 0.0], color: color.to_array(), intensity: *intensity, kind: 0, _pad: [0.0; 3] },
+            rustracer_core::scene::LightGpu { data: [position.x, position.y, position.z, 0.0], color: color.to_array(), intensity: *intensity, kind: 0, _pad_a: [0.0; 3], _pad_b: [0.0; 4] },
         rustracer_core::scene::Light::Directional { direction, color, intensity } =>
-            rustracer_core::scene::LightGpu { data: [direction.x, direction.y, direction.z, 0.0], color: color.to_array(), intensity: *intensity, kind: 1, _pad: [0.0; 3] },
+            rustracer_core::scene::LightGpu { data: [direction.x, direction.y, direction.z, 0.0], color: color.to_array(), intensity: *intensity, kind: 1, _pad_a: [0.0; 3], _pad_b: [0.0; 4] },
         rustracer_core::scene::Light::Area { triangle_index, color, intensity } =>
-            rustracer_core::scene::LightGpu { data: [*triangle_index as f32, 0.0, 0.0, 0.0], color: color.to_array(), intensity: *intensity, kind: 2, _pad: [0.0; 3] },
+            rustracer_core::scene::LightGpu { data: [*triangle_index as f32, 0.0, 0.0, 0.0], color: color.to_array(), intensity: *intensity, kind: 2, _pad_a: [0.0; 3], _pad_b: [0.0; 4] },
         rustracer_core::scene::Light::Environment { intensity, .. } =>
-            rustracer_core::scene::LightGpu { data: [0.0; 4], color: [1.0, 1.0, 1.0], intensity: *intensity, kind: 3, _pad: [0.0; 3] },
+            rustracer_core::scene::LightGpu { data: [0.0; 4], color: [1.0, 1.0, 1.0], intensity: *intensity, kind: 3, _pad_a: [0.0; 3], _pad_b: [0.0; 4] },
     }
+}
+
+/// Upload a role's textures as one `texture_2d_array` (layers = texture
+/// count; empty roles get a 1x1x1 placeholder so bindings stay valid).
+fn create_role_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    textures: &[rustracer_core::texture::Texture],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let layers = textures.len().max(1) as u32;
+    let (width, height) = textures
+        .first()
+        .map(|t| (t.width, t.height))
+        .unwrap_or((1, 1));
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    for (i, tex) in textures.iter().enumerate() {
+        // Quantize the linear floats to unorm bytes (values are [0,1]).
+        let bytes: Vec<u8> = tex
+            .data
+            .iter()
+            .flat_map(|c| {
+                [
+                    (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                    (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                    (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                    (c[3].clamp(0.0, 1.0) * 255.0) as u8,
+                ]
+            })
+            .collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width: tex.width.min(width), height: tex.height.min(height), depth_or_array_layers: 1 },
+        );
+    }
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(&format!("{label}_view")),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
 }

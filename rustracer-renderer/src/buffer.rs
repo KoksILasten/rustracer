@@ -17,13 +17,25 @@ impl<T: bytemuck::Pod> TypedBuffer<T> {
         data: &[T],
         usage: wgpu::BufferUsages,
     ) -> Self {
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        });
+        // wgpu forbids zero-size buffers; keep at least one element and
+        // write real data only when there is any.
+        let capacity = data.len().max(1) as u64;
+        let buffer = if !data.is_empty() {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            })
+        } else {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<T>() as u64,
+                usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
         Self {
-            capacity: data.len() as u64,
+            capacity,
             buffer,
             _marker: PhantomData,
         }

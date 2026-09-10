@@ -214,7 +214,7 @@ async fn init_app(
     let enable_photon_map = false;
     let enable_denoise = true;
     let photon_debug = false;
-    let photon_scale = 0.005f32;
+    let photon_scale = 0.02f32;
 
     let render_config = RenderConfig {
         width, height,
@@ -227,7 +227,9 @@ async fn init_app(
         enable_photon_map,
         enable_denoise,
         photon_debug,
+        debug_view: 0,
         photon_scale,
+        photon_radius: 0.5,
         ambient,
     };
 
@@ -238,13 +240,7 @@ async fn init_app(
         create_test_scene()
     };
 
-    let camera = Camera {
-        position: glam::Vec3::new(0.0, 0.3, 3.5),
-        look_at: glam::Vec3::new(0.0, 0.2, 0.0),
-        up: glam::Vec3::Y,
-        fov_degrees: 70.0,
-        ..Default::default()
-    };
+    let camera = frame_camera(&scene);
 
     let mut renderer = Renderer::new(&adapter, render_config, &scene).await?;
     renderer.update_camera(&camera);
@@ -323,13 +319,13 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Exposure:");
-                    let mut changed = ui.add(egui::Slider::new(&mut state.exposure, 0.1..=5.0)).changed();
+                    let changed = ui.add(egui::Slider::new(&mut state.exposure, 0.1..=5.0)).changed();
                     ui.add(egui::DragValue::new(&mut state.exposure).range(0.01..=10.0).speed(0.1));
                     if changed { state.renderer.config.exposure = state.exposure; state.renderer.reset_accumulation(); }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Gamma:");
-                    let mut changed = ui.add(egui::Slider::new(&mut state.gamma, 0.5..=4.0)).changed();
+                    let changed = ui.add(egui::Slider::new(&mut state.gamma, 0.5..=4.0)).changed();
                     ui.add(egui::DragValue::new(&mut state.gamma).range(0.1..=10.0).speed(0.1));
                     if changed { state.renderer.config.gamma = state.gamma; state.renderer.reset_accumulation(); }
                 });
@@ -348,7 +344,7 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Photon Scale:");
-                    if ui.add(egui::Slider::new(&mut state.photon_scale, 0.0..=0.05).logarithmic(true)).changed() {
+                    if ui.add(egui::Slider::new(&mut state.photon_scale, 0.0..=2.0).logarithmic(true)).changed() {
                         state.renderer.config.photon_scale = state.photon_scale;
                         state.renderer.reset_accumulation();
                     }
@@ -363,7 +359,7 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
 
                 ui.horizontal(|ui| {
                     ui.label("Accum. Frames:");
-                    let mut changed = ui.add(egui::Slider::new(&mut state.accumulate_frames, 0u32..=60)).changed();
+                    let changed = ui.add(egui::Slider::new(&mut state.accumulate_frames, 0u32..=60)).changed();
                     ui.add(egui::DragValue::new(&mut state.accumulate_frames).range(0..=120).speed(1));
                     if changed { state.renderer.config.accumulate_frames = state.accumulate_frames; }
                 });
@@ -406,7 +402,7 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                     state.enable_photon_map = false; state.renderer.config.enable_photon_map = false;
                     state.enable_denoise = true; state.renderer.config.enable_denoise = true;
                     state.photon_debug = false; state.renderer.config.photon_debug = false;
-                    state.photon_scale = 0.005; state.renderer.config.photon_scale = 0.005;
+                    state.photon_scale = 0.02; state.renderer.config.photon_scale = 0.02;
                     state.renderer.reset_accumulation();
                 }
             });
@@ -507,6 +503,26 @@ fn save_output(state: &AppState) {
 
 // ── Test scene: Cornell box with objects ──
 
+/// Frame the whole scene in view, whatever its size or position: place the
+/// camera on a diagonal at a distance that fits the bounds' bounding sphere.
+fn frame_camera(scene: &rustracer_core::scene::Scene) -> Camera {
+    if let Some((bmin, bmax)) = scene.bounds() {
+        let center = (bmin + bmax) * 0.5;
+        let diag = (bmax - bmin).length().max(1e-3);
+        let fov = 70f32.to_radians();
+        let dist = (diag * 0.5 / (fov * 0.5).tan()) * 1.3;
+        let dir = glam::Vec3::new(0.55, 0.35, 0.75).normalize();
+        return Camera {
+            position: center + dir * dist,
+            look_at: center,
+            up: glam::Vec3::Y,
+            fov_degrees: 70.0,
+            ..Default::default()
+        };
+    }
+    Camera::default()
+}
+
 fn create_test_scene() -> rustracer_core::scene::Scene {
     use glam::Vec3;
     use rustracer_core::material::Material;
@@ -554,8 +570,8 @@ fn create_test_scene() -> rustracer_core::scene::Scene {
         )));
     }
 
-    scene.lights.push(Light::Area { triangle_index: 10, color: Vec3::ONE, intensity: 8.0 });
-    scene.lights.push(Light::Area { triangle_index: 11, color: Vec3::ONE, intensity: 8.0 });
+    scene.lights.push(Light::Area { triangle_index: 10, color: Vec3::new(25.0, 20.0, 14.0), intensity: 1.0 });
+    scene.lights.push(Light::Area { triangle_index: 11, color: Vec3::new(25.0, 20.0, 14.0), intensity: 1.0 });
 
     scene
 }
@@ -571,14 +587,15 @@ fn create_quad(v0: glam::Vec3, v1: glam::Vec3, v2: glam::Vec3, v3: glam::Vec3) -
 
 /// Create a box from min to max. Returns 6 quads with the given material id.
 fn create_cube(min: glam::Vec3, max: glam::Vec3, material_id: usize) -> Vec<(Vec<glam::Vec3>, Vec<glam::Vec3>, Vec<glam::Vec2>, Vec<u32>, usize)> {
-    let m = min; let M = max;
+    let lo = min;
+    let hi = max;
     let faces: [(glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3); 6] = [
-        (glam::Vec3::new(m.x,m.y,m.z), glam::Vec3::new(m.x,M.y,m.z), glam::Vec3::new(m.x,M.y,M.z), glam::Vec3::new(m.x,m.y,M.z)), // -X
-        (glam::Vec3::new(M.x,m.y,M.z), glam::Vec3::new(M.x,M.y,M.z), glam::Vec3::new(M.x,M.y,m.z), glam::Vec3::new(M.x,m.y,m.z)), // +X
-        (glam::Vec3::new(m.x,m.y,M.z), glam::Vec3::new(M.x,m.y,M.z), glam::Vec3::new(M.x,m.y,m.z), glam::Vec3::new(m.x,m.y,m.z)), // -Y
-        (glam::Vec3::new(m.x,M.y,m.z), glam::Vec3::new(M.x,M.y,m.z), glam::Vec3::new(M.x,M.y,M.z), glam::Vec3::new(m.x,M.y,M.z)), // +Y
-        (glam::Vec3::new(M.x,m.y,m.z), glam::Vec3::new(M.x,M.y,m.z), glam::Vec3::new(m.x,M.y,m.z), glam::Vec3::new(m.x,m.y,m.z)), // -Z
-        (glam::Vec3::new(m.x,m.y,M.z), glam::Vec3::new(m.x,M.y,M.z), glam::Vec3::new(M.x,M.y,M.z), glam::Vec3::new(M.x,m.y,M.z)), // +Z
+        (glam::Vec3::new(lo.x,lo.y,lo.z), glam::Vec3::new(lo.x,hi.y,lo.z), glam::Vec3::new(lo.x,hi.y,hi.z), glam::Vec3::new(lo.x,lo.y,hi.z)), // -X
+        (glam::Vec3::new(hi.x,lo.y,hi.z), glam::Vec3::new(hi.x,hi.y,hi.z), glam::Vec3::new(hi.x,hi.y,lo.z), glam::Vec3::new(hi.x,lo.y,lo.z)), // +X
+        (glam::Vec3::new(lo.x,lo.y,hi.z), glam::Vec3::new(hi.x,lo.y,hi.z), glam::Vec3::new(hi.x,lo.y,lo.z), glam::Vec3::new(lo.x,lo.y,lo.z)), // -Y
+        (glam::Vec3::new(lo.x,hi.y,lo.z), glam::Vec3::new(hi.x,hi.y,lo.z), glam::Vec3::new(hi.x,hi.y,hi.z), glam::Vec3::new(lo.x,hi.y,hi.z)), // +Y
+        (glam::Vec3::new(hi.x,lo.y,lo.z), glam::Vec3::new(hi.x,hi.y,lo.z), glam::Vec3::new(lo.x,hi.y,lo.z), glam::Vec3::new(lo.x,lo.y,lo.z)), // -Z
+        (glam::Vec3::new(lo.x,lo.y,hi.z), glam::Vec3::new(lo.x,hi.y,hi.z), glam::Vec3::new(hi.x,hi.y,hi.z), glam::Vec3::new(hi.x,lo.y,hi.z)), // +Z
     ];
     faces.into_iter().map(|(v0, v1, v2, v3)| {
         let (p, n, t, i) = create_quad(v0, v1, v2, v3);

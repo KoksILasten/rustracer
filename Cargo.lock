@@ -2612,6 +2612,7 @@ dependencies = [
  "image",
  "rand 0.8.7",
  "serde",
+ "serde_json",
  "toml",
  "tracing",
 ]
@@ -2623,6 +2624,8 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "naga",
+ "pollster",
  "rustracer-core",
  "tracing",
  "wgpu",

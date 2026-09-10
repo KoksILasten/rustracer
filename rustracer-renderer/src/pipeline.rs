@@ -12,6 +12,8 @@ pub fn create_photon_trace_pipeline(
             storage_buffer_binding(0, true), storage_buffer_binding(1, false),
             storage_buffer_binding(2, false), storage_buffer_binding(3, false),
             storage_buffer_binding(4, false), storage_buffer_binding(5, false),
+            texture_array_binding(6), sampler_binding(7), texture_array_binding(8),
+            uniform_buffer_binding(9),
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -73,7 +75,9 @@ pub fn create_gather_pipeline(
             storage_buffer_binding(4, false), storage_buffer_binding(5, false),
             storage_buffer_binding(6, false), uniform_buffer_binding(7),
             storage_buffer_binding(8, true), storage_buffer_binding(9, false),
-            uniform_buffer_binding(10),
+            uniform_buffer_binding(10), storage_buffer_binding(11, false),
+            texture_array_binding(12), texture_array_binding(13), texture_array_binding(14),
+            sampler_binding(15), texture_array_binding(16),
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -204,6 +208,30 @@ fn uniform_buffer_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false, min_binding_size: None,
         },
+        count: None,
+    }
+}
+
+#[inline]
+fn texture_array_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+#[inline]
+fn sampler_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     }
 }

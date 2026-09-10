@@ -123,6 +123,18 @@ pub enum Light {
 }
 
 /// GPU-compatible light data for photon emission.
+///
+/// MUST match the WGSL `Light` struct in `common.wgsl` (64 bytes). WGSL
+/// pads `kind: u32` then aligns the trailing `_pad: vec3` to 16 bytes, so
+/// the Rust struct needs explicit padding to land the tail at offset 48:
+/// ```text
+/// 0   data: vec4       16
+/// 16  color: vec3      28
+/// 28  intensity: f32   32
+/// 32  kind: u32        36
+/// 36  (alignment gap)  48
+/// 48  _pad: vec3       60 → struct size 64
+/// ```
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LightGpu {
@@ -130,7 +142,8 @@ pub struct LightGpu {
     pub color: [f32; 3], // emission color
     pub intensity: f32,
     pub kind: u32, // 0=point, 1=directional, 2=area, 3=environment
-    pub _pad: [f32; 3],
+    pub _pad_a: [f32; 3],
+    pub _pad_b: [f32; 4],
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +155,18 @@ pub struct LightGpu {
 pub struct Scene {
     pub meshes: Vec<Arc<Mesh>>,
     pub materials: Vec<Material>,
+    /// Every glTF texture, kept in glTF texture order (linear, normalized
+    /// [0..1] floats). Normal maps and other non-sampled textures live here
+    /// too, but GPU upload only happens for the three role arrays below.
     pub textures: Vec<Texture>,
+    /// Albedo textures, uniform size, role-compacted layer indices.
+    pub tex_albedo: Vec<Texture>,
+    /// Metallic-roughness textures (G = roughness, B = metallic).
+    pub tex_mr: Vec<Texture>,
+    /// Emissive textures.
+    pub tex_emissive: Vec<Texture>,
+    /// Tangent-space normal maps.
+    pub tex_normal: Vec<Texture>,
     pub lights: Vec<Light>,
     pub environment_intensity: f32,
 }
@@ -153,6 +177,10 @@ impl Default for Scene {
             meshes: Vec::new(),
             materials: Vec::new(),
             textures: Vec::new(),
+            tex_albedo: Vec::new(),
+            tex_mr: Vec::new(),
+            tex_emissive: Vec::new(),
+            tex_normal: Vec::new(),
             lights: Vec::new(),
             environment_intensity: 1.0,
         }
@@ -163,6 +191,21 @@ impl Scene {
     /// Total triangle count across all meshes.
     pub fn triangle_count(&self) -> usize {
         self.meshes.iter().map(|m| m.triangle_count()).sum()
+    }
+
+    /// World-space bounds of all geometry, if any exists.
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut bb = crate::bvh::AABB::EMPTY;
+        for mesh in &self.meshes {
+            for p in &mesh.positions {
+                bb.extend(*p);
+            }
+        }
+        if bb.min.x > bb.max.x {
+            None
+        } else {
+            Some((bb.min, bb.max))
+        }
     }
 
     /// Flatten all triangles into a GPU-ready slice.
