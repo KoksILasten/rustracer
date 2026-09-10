@@ -133,7 +133,12 @@ pub fn create_denoise_pipeline(
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("denoise_bgl"),
-        entries: &[storage_buffer_binding(0, true), storage_buffer_binding(1, false), uniform_buffer_binding(2)],
+        entries: &[
+            storage_buffer_binding(0, false), // input: read_only
+            storage_buffer_binding(1, true),  // output: read_write
+            storage_buffer_binding(2, false), // gbuffer: read_only
+            uniform_buffer_binding(3),        // params: uniform
+        ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("denoise_layout"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
