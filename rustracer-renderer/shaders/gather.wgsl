@@ -24,6 +24,20 @@
 @group(0) @binding(14) var emissive_tex: texture_2d_array<f32>;
 @group(0) @binding(15) var tex_sampler: sampler;
 @group(0) @binding(16) var normal_tex: texture_2d_array<f32>;
+// Per-frame luminance moments (E[l], E[l²]) over this frame's spp samples.
+@group(0) @binding(17) var<storage, read_write> frame_moments: array<vec4<f32>>;
+
+// Luminance of a radiance sample (same weights as the denoiser).
+fn luma_of(c: vec3<f32>) -> f32 { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// Accumulate a radiance contribution into the pixel accumulator AND the
+// per-frame luminance moments used to estimate sampling variance.
+fn add_radiance(col: ptr<function, vec3<f32>>, lum_sum: ptr<function, f32>, lum2_sum: ptr<function, f32>, c: vec3<f32>) {
+    *col += c;
+    let l = luma_of(c);
+    *lum_sum += l;
+    *lum2_sum += l * l;
+}
 
 struct GridParams {
     room_min_x: f32, room_min_y: f32, room_min_z: f32,
@@ -185,6 +199,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let base_seed = pixel.y * img_params.width + pixel.x + img_params.frame * 2654435761u;
     var rng = rng_init(base_seed * 1664525u + 1013904223u);
     var col = vec3(0.0);
+    var lum_sum = 0.0;
+    var lum2_sum = 0.0;
     var first_normal = vec3(0.0, 1.0, 0.0);
     var first_depth = 1e30;
     let spp = max(1u, img_params.spp);
@@ -215,7 +231,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let hit = trace_bvh(ro, rd);
             if hit.t >= INF {
                 // Background: environment dome.
-                col += thr * sky_color(rd, env_intensity) * env_color;
+                add_radiance(&col, &lum_sum, &lum2_sum, thr * sky_color(rd, env_intensity) * env_color);
                 break;
             }
             let tr = triangles[hit.prim_id];
@@ -265,7 +281,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 continue;
             }
 
-            col += thr * emissive_at(mat, uv_hit);
+            add_radiance(&col, &lum_sum, &lum2_sum, thr * emissive_at(mat, uv_hit));
 
             // Debug views: dump the raw value and stop bouncing.
             // 1 = UVs, 2 = smooth normal, 3 = perturbed normal, 4 = flat normal.
@@ -359,11 +375,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 var direct = direct_light(hp, shn, &rng);
                 // Environment hemisphere contribution (approximate irradiance).
                 if env_intensity > 0.0 && !do_spec {
-                    col += thr * diffuse_weight * sky_color(shn, env_intensity) * env_color;
+                    add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * sky_color(shn, env_intensity) * env_color);
                 }
-                col += thr * diffuse_weight * direct / PI;
+                add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * direct / PI);
                 // Simple ambient term as a last-resort fill.
-                col += thr * albedo * img_params.ambient;
+                add_radiance(&col, &lum_sum, &lum2_sum, thr * albedo * img_params.ambient);
             }
 
             // Photon-map indirect (only on the diffuse path).
@@ -402,7 +418,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     }
                 }
                 if ph_hits > 0u {
-                    col += thr * diffuse_weight * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius);
+                    add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius));
                 }
                 if img_params.photon_debug == 1u {
                     let density = min(f32(ph_hits) / 64.0, 1.0);
@@ -440,6 +456,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // into the EMA accumulation history (denoise runs on `frame`, never on
     // the history buffer itself — that would re-filter the running average).
     frame[idx] = vec4(col, 1.0);
+    // Per-frame luminance moments over the spp samples. The denoiser scales
+    // this variance by the EMA attenuation factor alpha/(2-alpha) to get
+    // the residual noise of the accumulated history.
+    frame_moments[idx] = vec4(min(lum_sum / f32(spp), 10.0), min(lum2_sum / f32(spp), 100.0), 0.0, 0.0);
     // Write GBuffer (denoiser guidance): normal.xyz + depth.w
     gbuffer[idx] = vec4(first_normal, first_depth);
 }

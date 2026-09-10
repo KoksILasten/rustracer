@@ -70,14 +70,24 @@ pub fn create_gather_pipeline(
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gather_bgl"),
         entries: &[
-            storage_buffer_binding(0, false), storage_buffer_binding(1, true),
-            uniform_buffer_binding(2), storage_buffer_binding(3, false),
-            storage_buffer_binding(4, false), storage_buffer_binding(5, false),
-            storage_buffer_binding(6, false), uniform_buffer_binding(7),
-            storage_buffer_binding(8, true), storage_buffer_binding(9, false),
-            uniform_buffer_binding(10), storage_buffer_binding(11, false),
-            texture_array_binding(12), texture_array_binding(13), texture_array_binding(14),
-            sampler_binding(15), texture_array_binding(16),
+            storage_buffer_binding(0, false),
+            storage_buffer_binding(1, true),
+            uniform_buffer_binding(2),
+            storage_buffer_binding(3, false),
+            storage_buffer_binding(4, false),
+            storage_buffer_binding(5, false),
+            storage_buffer_binding(6, false),
+            uniform_buffer_binding(7),
+            storage_buffer_binding(8, true),
+            storage_buffer_binding(9, false),
+            uniform_buffer_binding(10),
+            storage_buffer_binding(11, false),
+            texture_array_binding(12),
+            texture_array_binding(13),
+            texture_array_binding(14),
+            sampler_binding(15),
+            texture_array_binding(16),
+            storage_buffer_binding(17, true), // frame_moments (rw)
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -116,7 +126,11 @@ pub fn create_composite_pipeline(
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("composite_bgl"),
-        entries: &[storage_buffer_binding(0, false), storage_buffer_binding(1, true), uniform_buffer_binding(2)],
+        entries: &[
+            storage_buffer_binding(0, false), // frame (read)
+            storage_buffer_binding(1, true),  // accumulation (rw)
+            uniform_buffer_binding(2),
+        ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("composite_layout"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
@@ -134,10 +148,11 @@ pub fn create_denoise_pipeline(
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("denoise_bgl"),
         entries: &[
-            storage_buffer_binding(0, false), // input: read_only
-            storage_buffer_binding(1, true),  // output: read_write
-            storage_buffer_binding(2, false), // gbuffer: read_only
-            uniform_buffer_binding(3),        // params: uniform
+            storage_buffer_binding(0, false), // input frame (read)
+            storage_buffer_binding(1, true),  // output frame (rw)
+            storage_buffer_binding(2, false), // gbuffer (read)
+            storage_buffer_binding(3, false), // accumulated luminance moments (read)
+            uniform_buffer_binding(4),        // params
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

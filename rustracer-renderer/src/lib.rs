@@ -78,7 +78,7 @@ pub struct ToneMapUniform { pub exposure: f32, pub gamma: f32, pub sample_count:
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct DenoiseParamsUniform { pub width: u32, pub height: u32, pub step_size: u32, pub phi_color: f32, pub phi_normal: f32, pub phi_depth: f32, pub _pad: [u32; 2] }
+pub struct DenoiseParamsUniform { pub width: u32, pub height: u32, pub step_size: u32, pub lambda: f32, pub phi_normal: f32, pub phi_depth: f32, pub alpha: f32, pub _pad: u32 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -106,8 +106,9 @@ pub struct GpuBuffers {
     pub camera:       buffer::UniformBuffer<CameraUniform>,
     pub photons:      buffer::TypedBuffer<PhotonGpu>,
     pub accumulation: buffer::TypedBuffer<[f32; 4]>,
-    pub frame:        buffer::TypedBuffer<[f32; 4]>, // raw frame; denoise works here, never on accumulation
+    pub frame:        buffer::TypedBuffer<[f32; 4]>, // raw frame from gather
     pub denoise_pingpong: buffer::TypedBuffer<[f32; 4]>,
+    pub frame_moments: buffer::TypedBuffer<[f32; 4]>, // per-frame (E[l], E[l²]) over the spp samples
     pub gbuffer:      buffer::TypedBuffer<[f32; 4]>, // normal.xyz + depth.w
     pub sample_count: buffer::UniformBuffer<SampleCountUniform>,
     pub tonemap_params: buffer::UniformBuffer<ToneMapUniform>,
@@ -179,15 +180,16 @@ impl Renderer {
         let accumulation = buffer::TypedBuffer::new_zeroed(&device, "accumulation", num_pixels, wgpu::BufferUsages::STORAGE);
         let frame = buffer::TypedBuffer::new_zeroed(&device, "frame", num_pixels, wgpu::BufferUsages::STORAGE);
         let denoise_pingpong = buffer::TypedBuffer::new_zeroed(&device, "denoise_pingpong", num_pixels, wgpu::BufferUsages::STORAGE);
+        let frame_moments = buffer::TypedBuffer::new_zeroed(&device, "frame_moments", num_pixels, wgpu::BufferUsages::STORAGE);
         let gbuffer = buffer::TypedBuffer::new_zeroed(&device, "gbuffer", num_pixels, wgpu::BufferUsages::STORAGE);
         let sample_count = buffer::UniformBuffer::new(&device, "sample_count", &SampleCountUniform { count: 0, _pad: [0; 3] });
         let tonemap_params = buffer::UniformBuffer::new(&device, "tonemap_params", &ToneMapUniform { exposure: 1.0, gamma: 2.2, sample_count: 0, width: config.width });
         let img_params = buffer::UniformBuffer::new(&device, "img_params", &ImageParams { width: config.width, height: config.height, spp: config.spp, frame: 0, light_emission: config.light_emission, ambient: config.ambient, accumulate_alpha: 0.0, use_photons: if config.enable_photon_map { 1 } else { 0 }, photon_count: config.photon_count, photon_radius: config.photon_radius, photon_scale: config.photon_scale, photon_debug: if config.photon_debug { 1 } else { 0 }, point_light_emission: config.point_light_emission, _pad: [config.debug_view, 0, 0] });
         let denoise_params = [
-            buffer::UniformBuffer::new(&device, "denoise_params_0", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] }),
-            buffer::UniformBuffer::new(&device, "denoise_params_1", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 2, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] }),
-            buffer::UniformBuffer::new(&device, "denoise_params_2", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 4, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] }),
-            buffer::UniformBuffer::new(&device, "denoise_params_3", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 8, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2] }),
+            buffer::UniformBuffer::new(&device, "denoise_params_0", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 1, lambda: 3.0, phi_normal: 12.0, phi_depth: 0.05, alpha: 1.0, _pad: 0 }),
+            buffer::UniformBuffer::new(&device, "denoise_params_1", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 2, lambda: 3.0, phi_normal: 12.0, phi_depth: 0.05, alpha: 1.0, _pad: 0 }),
+            buffer::UniformBuffer::new(&device, "denoise_params_2", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 4, lambda: 3.0, phi_normal: 12.0, phi_depth: 0.05, alpha: 1.0, _pad: 0 }),
+            buffer::UniformBuffer::new(&device, "denoise_params_3", &DenoiseParamsUniform { width: config.width, height: config.height, step_size: 8, lambda: 3.0, phi_normal: 12.0, phi_depth: 0.05, alpha: 1.0, _pad: 0 }),
         ];
         let composite_params = buffer::UniformBuffer::new(&device, "composite_params", &CompositeParams { width: config.width, height: config.height, alpha: 1.0, _pad: 0 });
         // Per-scene photon grid: cover the scene bounds with a cell size
@@ -251,7 +253,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, frame, denoise_pingpong, gbuffer, sample_count, tonemap_params, img_params, denoise_params, composite_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, tex_albedo, tex_albedo_view, tex_mr, tex_mr_view, tex_emissive, tex_emissive_view, tex_normal, tex_normal_view, tex_sampler, output_texture, output_view };
+        let buffers = GpuBuffers { triangles, bvh_nodes, bvh_prims, materials, lights, camera, photons, accumulation, frame, denoise_pingpong, frame_moments, gbuffer, sample_count, tonemap_params, img_params, denoise_params, composite_params, grid_params, grid_counts, grid_meta, grid_cursor, sorted_photons, tex_albedo, tex_albedo_view, tex_mr, tex_mr_view, tex_emissive, tex_emissive_view, tex_normal, tex_normal_view, tex_sampler, output_texture, output_view };
 
         // Sampler for fullscreen quad
         let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -317,15 +319,23 @@ impl Renderer {
             pass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
         }
 
-        // Pass 2: Denoise (4 A-Trous wavelet iterations with increasing step sizes 1, 2, 4, 8).
-        // Uses ping-pong buffers so each pass reads strictly from an immutable input
-        // buffer, preventing intra-frame compute workgroup race conditions and tile seams.
+        // Pass 2: Denoise the FRESH frame (4 A-Trous wavelet iterations,
+        // steps 1/2/4/8, ping-pong buffers), gated on the per-frame
+        // variance scaled by alpha/(2-alpha) — the residual variance an
+        // EMA history converges to. With accumulate_frames == 0 (alpha = 1)
+        // the gate is the full fresh-frame variance and the denoiser works
+        // at full strength. With accumulation ON, the fresh 4-spp noise is
+        // far above the EMA's residual variance, so the weights collapse
+        // and the denoiser stands down — the EMA itself removes the noise
+        // over frames without ever touching texture detail. Filtering the
+        // fresh frame (never the history buffer) also keeps the history
+        // free of compounded smoothing bias.
         if self.config.enable_denoise {
             for iter in 0..4usize {
                 let step = 1u32 << iter;
                 self.buffers.denoise_params[iter].write(&self.queue, &DenoiseParamsUniform {
                     width: self.config.width, height: self.config.height,
-                    step_size: step, phi_color: 0.3, phi_normal: 12.0, phi_depth: 0.05, _pad: [0; 2],
+                    step_size: step, lambda: 3.0, phi_normal: 12.0, phi_depth: 0.05, alpha, _pad: 0,
                 });
 
                 let (in_buf, out_buf) = if iter % 2 == 0 {
@@ -341,7 +351,8 @@ impl Renderer {
                         wgpu::BindGroupEntry { binding: 0, resource: in_buf.buffer().as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: out_buf.buffer().as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 2, resource: self.buffers.gbuffer.buffer().as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: self.buffers.denoise_params[iter].buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: self.buffers.frame_moments.buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: self.buffers.denoise_params[iter].buffer().as_entire_binding() },
                     ],
                 });
 
@@ -512,7 +523,7 @@ impl GpuBuffers {
         ]
     }
 
-    fn gather_entries(&self) -> [wgpu::BindGroupEntry<'_>; 17] {
+    fn gather_entries(&self) -> [wgpu::BindGroupEntry<'_>; 18] {
         [
             wgpu::BindGroupEntry { binding: 0, resource: self.sorted_photons.buffer().as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: self.frame.buffer().as_entire_binding() },
@@ -531,6 +542,7 @@ impl GpuBuffers {
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&self.tex_emissive_view) },
             wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(&self.tex_sampler) },
             wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&self.tex_normal_view) },
+            wgpu::BindGroupEntry { binding: 17, resource: self.frame_moments.buffer().as_entire_binding() },
         ]
     }
 
