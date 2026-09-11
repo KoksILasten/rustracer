@@ -30,13 +30,15 @@
 // Luminance of a radiance sample (same weights as the denoiser).
 fn luma_of(c: vec3<f32>) -> f32 { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
-// Accumulate a radiance contribution into the pixel accumulator AND the
-// per-frame luminance moments used to estimate sampling variance.
-fn add_radiance(col: ptr<function, vec3<f32>>, lum_sum: ptr<function, f32>, lum2_sum: ptr<function, f32>, c: vec3<f32>) {
+// Accumulate a radiance contribution into the pixel accumulator, the
+// per-frame luminance moments (variance estimate for the denoiser), and
+// the PER-SAMPLE luminance used for robust firefly clamping.
+fn add_radiance(s: u32, col: ptr<function, vec3<f32>>, lum_sum: ptr<function, f32>, lum2_sum: ptr<function, f32>, sample_lum: ptr<function, array<f32, 8>>, c: vec3<f32>) {
     *col += c;
     let l = luma_of(c);
     *lum_sum += l;
     *lum2_sum += l * l;
+    if s < 8u { (*sample_lum)[s] += l; }
 }
 
 struct GridParams {
@@ -201,6 +203,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var col = vec3(0.0);
     var lum_sum = 0.0;
     var lum2_sum = 0.0;
+    // Per-sample luminance for robust firefly clamping (see the tail of
+    // this shader). Zero-initialize: WGSL requires full initialization.
+    var sample_lum: array<f32, 8>;
+    for (var init_i = 0u; init_i < 8u; init_i++) { sample_lum[init_i] = 0.0; }
     var first_normal = vec3(0.0, 1.0, 0.0);
     var first_depth = 1e30;
     let spp = max(1u, img_params.spp);
@@ -231,7 +237,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let hit = trace_bvh(ro, rd);
             if hit.t >= INF {
                 // Background: environment dome.
-                add_radiance(&col, &lum_sum, &lum2_sum, thr * sky_color(rd, env_intensity) * env_color);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * sky_color(rd, env_intensity) * env_color);
                 break;
             }
             let tr = triangles[hit.prim_id];
@@ -281,7 +287,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 continue;
             }
 
-            add_radiance(&col, &lum_sum, &lum2_sum, thr * emissive_at(mat, uv_hit));
+            add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * emissive_at(mat, uv_hit));
 
             // Debug views: dump the raw value and stop bouncing.
             // 1 = UVs, 2 = smooth normal, 3 = perturbed normal, 4 = flat normal.
@@ -375,11 +381,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 var direct = direct_light(hp, shn, &rng);
                 // Environment hemisphere contribution (approximate irradiance).
                 if env_intensity > 0.0 && !do_spec {
-                    add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * sky_color(shn, env_intensity) * env_color);
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * sky_color(shn, env_intensity) * env_color);
                 }
-                add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * direct / PI);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * direct / PI);
                 // Simple ambient term as a last-resort fill.
-                add_radiance(&col, &lum_sum, &lum2_sum, thr * albedo * img_params.ambient);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * albedo * img_params.ambient);
             }
 
             // Photon-map indirect (only on the diffuse path).
@@ -418,7 +424,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     }
                 }
                 if ph_hits > 0u {
-                    add_radiance(&col, &lum_sum, &lum2_sum, thr * diffuse_weight * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius));
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius));
                 }
                 if img_params.photon_debug == 1u {
                     let density = min(f32(ph_hits) / 64.0, 1.0);
@@ -447,9 +453,48 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             thr = thr / p;
         }
     }
-    // Clamp fireflies before accumulation: a single huge specular/light
-    // sample would otherwise persist as a white speckle (the denoiser's
-    // edge-stopping deliberately keeps high-contrast pixels).
+    // --- Robust firefly suppression (sigma clamping) ---------------------
+    // A single huge specular/light sample in a dark pixel would otherwise
+    // dominate the spp average and shimmer frame to frame. Clamp sample
+    // luminances to median + 3*sigma, where the median and spread come
+    // from the samples themselves (robust against up to half the samples
+    // being outliers; the fixed absolute clamp below stays as a last
+    // resort). Colors are rescaled by the clamped/total luminance ratio,
+    // preserving hue while capping the outlier's energy.
+    let do_clamp = spp <= 8u;
+    if do_clamp {
+        // Insertion sort of the per-sample luminances.
+        for (var i = 1u; i < spp; i++) {
+            let key = sample_lum[i];
+            var j = i;
+            while (j > 0u && sample_lum[j - 1u] > key) {
+                sample_lum[j] = sample_lum[j - 1u];
+                j = j - 1u;
+            }
+            sample_lum[j] = key;
+        }
+        let median = (sample_lum[(spp - 1u) / 2u] + sample_lum[spp / 2u]) * 0.5;
+        let half = max(spp / 2u, 1u);
+        var spread = 0.0;
+        for (var i = 0u; i < half; i++) {
+            let d = sample_lum[i] - median;
+            spread += d * d;
+        }
+        let sigma = max(sqrt(spread / f32(half)), 0.25 * median + 1e-5);
+        let thresh = median + 3.0 * sigma;
+        var clamped_lum = 0.0;
+        var clamped_lum2 = 0.0;
+        for (var i = 0u; i < spp; i++) {
+            let lc = min(sample_lum[i], thresh);
+            clamped_lum += lc;
+            clamped_lum2 += lc * lc;
+        }
+        col = col * (clamped_lum / max(lum_sum, 1e-10));
+        lum_sum = clamped_lum;
+        lum2_sum = clamped_lum2;
+    }
+
+    // Absolute last-resort clamp before accumulation.
     col = min(col / f32(spp), vec3(10.0));
     let idx = pixel.y * img_params.width + pixel.x;
     // The raw sample goes to the frame buffer; the composite pass blends it
