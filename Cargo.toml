@@ -27,7 +27,6 @@ gltf = "1.4"
 
 # Images
 image = "0.25"
-exr = "1.72"
 
 # Utilities
 bytemuck = { version = "1.21", features = ["derive"] }

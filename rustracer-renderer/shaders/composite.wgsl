@@ -1,10 +1,6 @@
-// Composite pass: blend the fresh frame into the EMA accumulation history.
-// The denoiser runs AFTER this pass, on the accumulated image, and gates on
-// the per-frame luminance variance (from gather) scaled by the EMA
-// attenuation factor alpha/(2-alpha) — the residual variance of the
-// history. As the history converges the denoiser's weights collapse, so it
-// stops filtering: noise keeps getting removed, texture detail is left
-// alone, and no compounding can occur.
+// Composite pass: blend the fresh (denoised) frame into the EMA accumulation
+// history. The denoiser runs BEFORE this pass, on the fresh frame only —
+// never on the history buffer, which would re-filter the running average.
 
 @group(0) @binding(0) var<storage, read> frame: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> accumulation: array<vec4<f32>>;

@@ -6,40 +6,52 @@
 
 use std::path::PathBuf;
 
-fn frame_camera(scene: &rustracer_core::scene::Scene) -> rustracer_core::camera::Camera {
-    use rustracer_core::camera::Camera;
-    if let Some((bmin, bmax)) = scene.bounds() {
-        let center = (bmin + bmax) * 0.5;
-        let diag = (bmax - bmin).length().max(1e-3);
-        let fov = 70f32.to_radians();
-        let dist = (diag * 0.5 / (fov * 0.5).tan()) * 1.3;
-        let dir = glam::Vec3::new(0.55, 0.35, 0.75).normalize();
-        return Camera {
-            position: center + dir * dist,
-            look_at: center,
-            up: glam::Vec3::Y,
-            fov_degrees: 70.0,
-            ..Default::default()
-        };
-    }
-    Camera::default()
-}
-
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).expect("usage: render_headless <scene.gltf> [frames]");
-    let frames: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(128);
-    let out = std::env::args().nth(3).unwrap_or_else(|| "render_headless.png".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: render_headless <scene.gltf> [frames]");
+    let frames: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let out = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "render_headless.png".to_string());
     let denoise = std::env::args().nth(4).map(|s| s == "1").unwrap_or(false);
     let app_like = std::env::args().nth(5).map(|s| s == "1").unwrap_or(false);
     let photons = std::env::args().nth(6).map(|s| s == "1").unwrap_or(false);
-    let spp_arg: u32 = std::env::args().nth(7).and_then(|s| s.parse().ok()).unwrap_or(if app_like { 4 } else { 1 });
-    let accum_arg: u32 = std::env::args().nth(8).and_then(|s| s.parse().ok()).unwrap_or(if app_like { 0 } else { frames });
-    let w_arg: u32 = std::env::args().nth(9).and_then(|s| s.parse().ok()).unwrap_or(800);
-    let h_arg: u32 = std::env::args().nth(10).and_then(|s| s.parse().ok()).unwrap_or(600);
-    let debug_view: u32 = std::env::args().nth(11).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let zoom_arg: f32 = std::env::args().nth(12).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let orbit_yaw: f32 = std::env::args().nth(13).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let orbit_pitch: f32 = std::env::args().nth(14).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let spp_arg: u32 = std::env::args()
+        .nth(7)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if app_like { 4 } else { 1 });
+    let accum_arg: u32 = std::env::args()
+        .nth(8)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if app_like { 0 } else { frames });
+    let w_arg: u32 = std::env::args()
+        .nth(9)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(800);
+    let h_arg: u32 = std::env::args()
+        .nth(10)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let debug_view: u32 = std::env::args()
+        .nth(11)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let zoom_arg: f32 = std::env::args()
+        .nth(12)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let orbit_yaw: f32 = std::env::args()
+        .nth(13)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let orbit_pitch: f32 = std::env::args()
+        .nth(14)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let raw_save = std::env::args().nth(15).map(|s| s == "1").unwrap_or(false);
 
     let scene = rustracer_core::loader::load_gltf(PathBuf::from(&path))?;
@@ -65,15 +77,15 @@ fn main() -> anyhow::Result<()> {
         enable_denoise: denoise || app_like,
         enable_photon_map: photons,
         photon_count: 50_000,
-        max_bounces: 6,
         debug_view,
         ..Default::default()
     };
-    let mut renderer = pollster::block_on(rustracer_renderer::Renderer::new(&adapter, config, &scene))?;
+    let mut renderer =
+        pollster::block_on(rustracer_renderer::Renderer::new(&adapter, config, &scene))?;
     if photons {
         renderer.rebuild_photons()?;
     }
-    let mut camera = frame_camera(&scene);
+    let mut camera = rustracer_core::camera::Camera::frame_scene(&scene);
     if zoom_arg != 0.0 {
         camera.zoom(zoom_arg);
     }
@@ -84,7 +96,11 @@ fn main() -> anyhow::Result<()> {
 
     let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("headless_target"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,

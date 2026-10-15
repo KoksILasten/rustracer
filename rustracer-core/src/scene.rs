@@ -117,7 +117,10 @@ pub enum Light {
         intensity: f32,
     },
     Environment {
-        texture: Option<usize>, // HDR environment map index, or None for procedural sky
+        /// Procedural sky gradient color straight up (zenith).
+        color_zenith: Vec3,
+        /// Procedural sky gradient color at the horizon.
+        color_horizon: Vec3,
         intensity: f32,
     },
 }
@@ -168,7 +171,6 @@ pub struct Scene {
     /// Tangent-space normal maps.
     pub tex_normal: Vec<Texture>,
     pub lights: Vec<Light>,
-    pub environment_intensity: f32,
 }
 
 impl Default for Scene {
@@ -182,7 +184,6 @@ impl Default for Scene {
             tex_emissive: Vec::new(),
             tex_normal: Vec::new(),
             lights: Vec::new(),
-            environment_intensity: 1.0,
         }
     }
 }
@@ -214,15 +215,39 @@ impl Scene {
         for mesh in &self.meshes {
             for t in 0..mesh.triangle_count() {
                 let [i0, i1, i2] = mesh.triangle_indices(t);
-                let v0 = mesh.positions.get(i0 as usize).copied().unwrap_or(Vec3::ZERO);
-                let v1 = mesh.positions.get(i1 as usize).copied().unwrap_or(Vec3::ZERO);
-                let v2 = mesh.positions.get(i2 as usize).copied().unwrap_or(Vec3::ZERO);
+                let v0 = mesh
+                    .positions
+                    .get(i0 as usize)
+                    .copied()
+                    .unwrap_or(Vec3::ZERO);
+                let v1 = mesh
+                    .positions
+                    .get(i1 as usize)
+                    .copied()
+                    .unwrap_or(Vec3::ZERO);
+                let v2 = mesh
+                    .positions
+                    .get(i2 as usize)
+                    .copied()
+                    .unwrap_or(Vec3::ZERO);
                 let n0 = mesh.normals.get(i0 as usize).copied().unwrap_or(Vec3::Y);
                 let n1 = mesh.normals.get(i1 as usize).copied().unwrap_or(Vec3::Y);
                 let n2 = mesh.normals.get(i2 as usize).copied().unwrap_or(Vec3::Y);
-                let uv0 = mesh.texcoords.get(i0 as usize).copied().unwrap_or(Vec2::ZERO);
-                let uv1 = mesh.texcoords.get(i1 as usize).copied().unwrap_or(Vec2::ZERO);
-                let uv2 = mesh.texcoords.get(i2 as usize).copied().unwrap_or(Vec2::ZERO);
+                let uv0 = mesh
+                    .texcoords
+                    .get(i0 as usize)
+                    .copied()
+                    .unwrap_or(Vec2::ZERO);
+                let uv1 = mesh
+                    .texcoords
+                    .get(i1 as usize)
+                    .copied()
+                    .unwrap_or(Vec2::ZERO);
+                let uv2 = mesh
+                    .texcoords
+                    .get(i2 as usize)
+                    .copied()
+                    .unwrap_or(Vec2::ZERO);
                 tris.push(TriangleGpu {
                     v0: v0.to_array(),
                     _pad0: 0.0,

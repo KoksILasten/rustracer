@@ -25,12 +25,6 @@ struct GridParams {
     _pad0: u32, _pad1: u32, _pad2: u32,
 }
 
-// Same gradient as gather's sky_color (kept in sync).
-fn sky_radiance(dir: vec3<f32>) -> vec3<f32> {
-    let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.55, 0.6, 0.75), vec3(0.95, 0.93, 0.9), pow(t, 0.5));
-}
-
 // ── Inline BVH traversal ──
 // Returns HitResult; hit.t == INF means miss.
 
@@ -164,7 +158,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         ray.dir = to_world(local_dir, n);
         power = light.color * light.intensity;
     } else if light.kind == 3u {
-        // Environment dome: emit from a sphere around the scene bounds.
+        // Environment dome: emit from a sphere around the scene bounds,
+        // tinted by the sky gradient (zenith = light.color, horizon =
+        // light.data.xyz) to match the gather pass.
         let local_dir = sample_cosine_hemisphere(&rng);
         let dir = to_world(local_dir, vec3(0.0, 1.0, 0.0));
         let span = vec3(f32(gp.grid_x), f32(gp.grid_y), f32(gp.grid_z)) * gp.cell_size;
@@ -172,7 +168,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let R = max(max(span.x, span.y), span.z) * 1.2 + 0.05;
         ray.origin = center + dir * R;
         ray.dir = -dir;
-        power = sky_radiance(dir) * light.intensity;
+        let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+        power = mix(light.color, light.data.xyz, pow(t, 0.5)) * light.intensity;
     } else {
         return;
     }

@@ -11,7 +11,10 @@ fn shared_struct_sizes_match_wgsl() {
     let module = naga::front::wgsl::parse_str(include_str!("../shaders/common.wgsl")).unwrap();
     let expected = [
         ("Light", size_of::<rustracer_core::scene::LightGpu>()),
-        ("Material", size_of::<rustracer_core::material::MaterialGpu>()),
+        (
+            "Material",
+            size_of::<rustracer_core::material::MaterialGpu>(),
+        ),
         ("Triangle", size_of::<rustracer_core::scene::TriangleGpu>()),
         ("BVHNode", size_of::<rustracer_core::bvh::BVHNode>()),
         ("Camera", size_of::<rustracer_core::camera::CameraUniform>()),
@@ -62,7 +65,9 @@ fn full_pipeline_dispatches_without_validation_errors() {
         // 1) Procedural scene: emissive quad + one triangle + environment.
         let mut scene = Scene::default();
         scene.materials.push(Material::lambertian(Vec3::splat(0.5)));
-        scene.materials.push(Material::emissive(Vec3::new(10.0, 10.0, 10.0), 1.0));
+        scene
+            .materials
+            .push(Material::emissive(Vec3::new(10.0, 10.0, 10.0), 1.0));
         scene.meshes.push(std::sync::Arc::new(Mesh::new(
             vec![
                 Vec3::new(-1.0, -1.0, 0.0),
@@ -86,7 +91,11 @@ fn full_pipeline_dispatches_without_validation_errors() {
             vec![0, 1, 2, 0, 2, 3],
             1, // emissive floor quad → 2 area lights
         )));
-        scene.lights.push(Light::Environment { texture: None, intensity: 0.2 });
+        scene.lights.push(Light::Environment {
+            color_zenith: Vec3::new(0.55, 0.6, 0.75),
+            color_horizon: Vec3::new(0.95, 0.93, 0.9),
+            intensity: 0.2,
+        });
         scenes.push(("procedural", scene));
 
         // 2) Bundled ToyCar glTF if it exists (this is the scene that
@@ -117,19 +126,24 @@ fn full_pipeline_dispatches_without_validation_errors() {
                 width: 32,
                 height: 32,
                 photon_count: 512,
-                max_bounces: 6,
                 enable_photon_map: true,
                 spp: 2,
                 ..Default::default()
             };
             let mut renderer = Renderer::new(&adapter, config, &scene).await.unwrap();
-            renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            renderer
+                .device
+                .push_error_scope(wgpu::ErrorFilter::Validation);
 
             renderer.rebuild_photons().unwrap();
 
             let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("headless_test_target"),
-                size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: 32,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,

@@ -44,17 +44,17 @@ pub enum MaterialKind {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct MaterialGpu {
-    pub albedo: [f32; 4],       // base color, linear RGB + alpha
-    pub emissive: [f32; 3],     // emission color (factor * texture average)
-    pub roughness: f32,         // GGX roughness (0 = mirror, 1 = diffuse)
-    pub metallic: f32,          // metalness (0 = dielectric, 1 = metal)
-    pub ior: f32,               // index of refraction for dielectrics
-    pub kind: u32,              // MaterialKind discriminant
-    pub flags: u32,             // MAT_FLAG_* bits
-    pub tex_albedo: u32,        // albedo texture-array layer or TEX_NONE
-    pub tex_mr: u32,            // metallic-roughness (R=occlusion G=rough B=metal) layer
-    pub tex_emissive: u32,      // emissive texture-array layer
-    pub tex_normal: u32,        // normal-map texture-array layer
+    pub albedo: [f32; 4],   // base color, linear RGB + alpha
+    pub emissive: [f32; 3], // emission color (factor * texture average)
+    pub roughness: f32,     // GGX roughness (0 = mirror, 1 = diffuse)
+    pub metallic: f32,      // metalness (0 = dielectric, 1 = metal)
+    pub ior: f32,           // index of refraction for dielectrics
+    pub kind: u32,          // MaterialKind discriminant
+    pub flags: u32,         // MAT_FLAG_* bits
+    pub tex_albedo: u32,    // albedo texture-array layer or TEX_NONE
+    pub tex_mr: u32,        // metallic-roughness (R=occlusion G=rough B=metal) layer
+    pub tex_emissive: u32,  // emissive texture-array layer
+    pub tex_normal: u32,    // normal-map texture-array layer
 }
 
 /// Host-side material definition.
@@ -70,8 +70,6 @@ pub struct Material {
     pub albedo_texture: Option<usize>,
     /// Layer index into `Scene::tex_mr` (metallic-roughness, G/B channels).
     pub roughness_texture: Option<usize>,
-    /// Kept for compatibility; unused (metallic shares the MR texture).
-    pub metallic_texture: Option<usize>,
     /// Layer index into `Scene::tex_emissive`.
     pub emissive_texture: Option<usize>,
     /// Layer index into `Scene::tex_normal` (tangent-space normal map).
@@ -91,7 +89,6 @@ impl Default for Material {
             emissive: Vec3::ZERO,
             albedo_texture: None,
             roughness_texture: None,
-            metallic_texture: None,
             emissive_texture: None,
             normal_texture: None,
             alpha_cutout: false,
@@ -190,7 +187,7 @@ mod tests {
     fn gpu_material_layout_is_64_bytes() {
         // Must match the WGSL `Material` struct in common.wgsl.
         assert_eq!(std::mem::size_of::<MaterialGpu>(), 64);
-        assert_eq!(std::mem::align_of::<MaterialGpu>(), 4.max(4));
+        assert_eq!(std::mem::align_of::<MaterialGpu>(), 4);
     }
 
     #[test]
@@ -211,11 +208,11 @@ mod tests {
         let bytes = bytemuck::bytes_of(&m);
         assert_eq!(f32::from_le_bytes(bytes[28..32].try_into().unwrap()), 3.0); // roughness
         assert_eq!(f32::from_le_bytes(bytes[32..36].try_into().unwrap()), 4.0); // metallic
-        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 6);   // kind
-        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 7);   // flags
-        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 8);   // tex_albedo
-        assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 10);  // tex_emissive
-        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 11);  // tex_normal
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 6); // kind
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 7); // flags
+        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 8); // tex_albedo
+        assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 10); // tex_emissive
+        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 11); // tex_normal
     }
 
     #[test]

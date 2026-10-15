@@ -3,6 +3,8 @@
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
+use crate::scene::Scene;
+
 /// A perspective pinhole camera.
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -11,7 +13,7 @@ pub struct Camera {
     pub up: Vec3,
     pub fov_degrees: f32,
     pub near: f32,
-    pub aperture: f32,  // depth-of-field (0 = pinhole)
+    pub aperture: f32, // depth-of-field (0 = pinhole)
     pub focus_dist: f32,
 }
 
@@ -74,6 +76,26 @@ impl Camera {
             focus_dist: self.focus_dist,
             _pad_end: [0.0; 2],
         }
+    }
+
+    /// Place the camera to frame an entire scene, whatever its size: on a
+    /// diagonal at a distance that fits the bounds' bounding sphere.
+    pub fn frame_scene(scene: &Scene) -> Self {
+        if let Some((bmin, bmax)) = scene.bounds() {
+            let center = (bmin + bmax) * 0.5;
+            let diag = (bmax - bmin).length().max(1e-3);
+            let fov = 70f32.to_radians();
+            let dist = (diag * 0.5 / (fov * 0.5).tan()) * 1.3;
+            let dir = Vec3::new(0.55, 0.35, 0.75).normalize();
+            return Self {
+                position: center + dir * dist,
+                look_at: center,
+                up: Vec3::Y,
+                fov_degrees: 70.0,
+                ..Default::default()
+            };
+        }
+        Self::default()
     }
 
     /// Orbit the camera around the look-at point.

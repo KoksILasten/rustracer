@@ -6,7 +6,6 @@ use wgpu::util::DeviceExt;
 /// A typed GPU buffer holding elements of type `T`.
 pub struct TypedBuffer<T: bytemuck::Pod> {
     buffer: wgpu::Buffer,
-    capacity: u64,
     _marker: PhantomData<T>,
 }
 
@@ -19,7 +18,6 @@ impl<T: bytemuck::Pod> TypedBuffer<T> {
     ) -> Self {
         // wgpu forbids zero-size buffers; keep at least one element and
         // write real data only when there is any.
-        let capacity = data.len().max(1) as u64;
         let buffer = if !data.is_empty() {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -35,7 +33,6 @@ impl<T: bytemuck::Pod> TypedBuffer<T> {
             })
         };
         Self {
-            capacity,
             buffer,
             _marker: PhantomData,
         }
@@ -55,7 +52,6 @@ impl<T: bytemuck::Pod> TypedBuffer<T> {
             mapped_at_creation: false,
         });
         Self {
-            capacity: count,
             buffer,
             _marker: PhantomData,
         }
@@ -67,22 +63,6 @@ impl<T: bytemuck::Pod> TypedBuffer<T> {
 
     pub fn write(&self, queue: &wgpu::Queue, data: &[T]) {
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
-    }
-
-    pub fn copy_to_staging(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        device: &wgpu::Device,
-    ) -> wgpu::Buffer {
-        let size = self.capacity * std::mem::size_of::<T>() as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_output"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging, 0, size);
-        staging
     }
 }
 
@@ -111,9 +91,5 @@ impl<T: bytemuck::Pod> UniformBuffer<T> {
 
     pub fn write(&self, queue: &wgpu::Queue, data: &T) {
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(data));
-    }
-
-    pub fn read(&self, _device: &wgpu::Device) -> T {
-        unsafe { std::mem::zeroed() }
     }
 }

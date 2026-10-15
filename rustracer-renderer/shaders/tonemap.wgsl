@@ -1,4 +1,4 @@
-// Tonemap: accumulation → display. No averaging (accumulation is overwritten each frame).
+// Tonemap: accumulated frame → display (exposure → Reinhard → gamma).
 
 @group(0) @binding(0) var<storage, read> accumulation: array<vec4<f32>>;
 @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
@@ -7,7 +7,6 @@
 struct ToneMapParams {
     exposure: f32,
     gamma: f32,
-    sample_count: u32,
     width: u32,
 }
 

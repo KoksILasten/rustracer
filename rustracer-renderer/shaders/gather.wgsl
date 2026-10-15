@@ -104,10 +104,9 @@ fn shadowed(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
 
 // Procedural sky: cool zenith, warm horizon — glTF scenes without their own
 // environment get a neutral studio-ish dome scaled by the env light.
-fn sky_color(dir: vec3<f32>, intensity: f32) -> vec3<f32> {
+fn sky_color(dir: vec3<f32>, zenith: vec3<f32>, horizon: vec3<f32>, intensity: f32) -> vec3<f32> {
     let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    let grad = mix(vec3(0.55, 0.6, 0.75), vec3(0.95, 0.93, 0.9), pow(t, 0.5));
-    return grad * intensity;
+    return mix(zenith, horizon, pow(t, 0.5)) * intensity;
 }
 
 struct MatParams {
@@ -213,13 +212,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Environment light info (intensity * color), if present.
     var env_intensity = 0.0;
-    var env_color = vec3(1.0);
+    var env_color = vec3(0.55, 0.6, 0.75);
+    var env_horizon = vec3(0.95, 0.93, 0.9);
     {
         let nl = arrayLength(&lights);
         for (var i = 0u; i < nl; i++) {
             if lights[i].kind == 3u {
                 env_intensity = lights[i].intensity;
                 env_color = lights[i].color;
+                env_horizon = lights[i].data.xyz;
                 break;
             }
         }
@@ -237,7 +238,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let hit = trace_bvh(ro, rd);
             if hit.t >= INF {
                 // Background: environment dome.
-                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * sky_color(rd, env_intensity) * env_color);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * sky_color(rd, env_color, env_horizon, env_intensity));
                 break;
             }
             let tr = triangles[hit.prim_id];
@@ -245,6 +246,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let hp = ro + rd * hit.t;
             let bb = barycentric(tr, ro, rd, hit.t);
             let uv_hit = bb.uv;
+
+            // Alpha-cutout: skip transparent texels *before* recording any
+            // G-buffer data, so the denoiser's normal/depth guidance comes
+            // from a surface the ray actually hit.
+            if (mat.flags & MAT_FLAG_ALPHA_CUTOUT) != 0u && mat.tex_albedo != TEX_NONE {
+                if textureSampleLevel(base_tex, tex_sampler, uv_hit, i32(mat.tex_albedo), 0.0).a < 0.5 {
+                    ro = hp + rd * 0.002;
+                    continue;
+                }
+            }
+
             let gn = get_triangle_normal(tr);
             let ff = dot(rd, gn) < 0.0;
             // Smooth interpolated geometric normal: used for the G-buffer
@@ -276,16 +288,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let albedo = params.albedo;
             let rough = params.rough;
             let metal = params.metal;
-            var alpha_val = 1.0;
-            if mat.tex_albedo != TEX_NONE {
-                alpha_val = textureSampleLevel(base_tex, tex_sampler, uv_hit, i32(mat.tex_albedo), 0.0).a;
-            }
-
-            // Alpha-cutout: skip this surface entirely.
-            if (mat.flags & MAT_FLAG_ALPHA_CUTOUT) != 0u && alpha_val < 0.5 {
-                ro = hp + rd * 0.002;
-                continue;
-            }
 
             add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * emissive_at(mat, uv_hit));
 
@@ -381,7 +383,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 var direct = direct_light(hp, shn, &rng);
                 // Environment hemisphere contribution (approximate irradiance).
                 if env_intensity > 0.0 && !do_spec {
-                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * sky_color(shn, env_intensity) * env_color);
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * sky_color(shn, env_color, env_horizon, env_intensity));
                 }
                 add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * direct / PI);
                 // Simple ambient term as a last-resort fill.

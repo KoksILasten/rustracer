@@ -46,7 +46,12 @@ fn decode_to_rgba(img: &gltf::image::Data) -> Option<Vec<[f32; 4]>> {
         }
         F::R8G8B8 => {
             for c in px.chunks_exact(3) {
-                out.push([c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0]);
+                out.push([
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                    1.0,
+                ]);
             }
         }
         F::R8G8B8A8 => {
@@ -125,7 +130,11 @@ fn decode_srgb(tex: &mut Texture) {
 /// Copy every used master texture into a uniform-size role array.
 /// Returns the role array and, for every master index, the role layer (or
 /// None when the texture is unused or was dropped).
-fn build_role(master: &[Texture], used: &[Option<usize>], srgb: bool) -> (Vec<Texture>, Vec<Option<usize>>) {
+fn build_role(
+    master: &[Texture],
+    used: &[Option<usize>],
+    srgb: bool,
+) -> (Vec<Texture>, Vec<Option<usize>>) {
     let mut map: Vec<Option<usize>> = vec![None; master.len()];
     if master.is_empty() {
         return (Vec::new(), map);
@@ -143,12 +152,17 @@ fn build_role(master: &[Texture], used: &[Option<usize>], srgb: bool) -> (Vec<Te
         if tex.width != ref_w || tex.height != ref_h {
             tracing::warn!(
                 "Dropping {}x{} texture from an array of {}x{} textures (mixed sizes are not supported yet)",
-                tex.width, tex.height, ref_w, ref_h
+                tex.width,
+                tex.height,
+                ref_w,
+                ref_h
             );
             continue;
         }
         if role.len() >= MAX_ROLE_LAYERS {
-            tracing::warn!("Too many textures for one role array (max {MAX_ROLE_LAYERS}); dropping the rest");
+            tracing::warn!(
+                "Too many textures for one role array (max {MAX_ROLE_LAYERS}); dropping the rest"
+            );
             continue;
         }
         let mut copy = tex.clone();
@@ -184,7 +198,10 @@ fn build_role_scaled(
         if tex.width != ref_w || tex.height != ref_h {
             tracing::warn!(
                 "Dropping {}x{} texture from an array of {}x{} textures (mixed sizes are not supported yet)",
-                tex.width, tex.height, ref_w, ref_h
+                tex.width,
+                tex.height,
+                ref_w,
+                ref_h
             );
             continue;
         }
@@ -221,7 +238,11 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
     for tex in document.textures() {
         let img = &images[tex.source().index()];
         match decode_to_rgba(img) {
-            Some(data) => scene.textures.push(Texture { width: img.width, height: img.height, data }),
+            Some(data) => scene.textures.push(Texture {
+                width: img.width,
+                height: img.height,
+                data,
+            }),
             None => scene.textures.push(Texture::solid([0.5, 0.5, 0.5, 1.0])),
         }
     }
@@ -252,8 +273,16 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
         };
 
         // glTF defaults that the old code got wrong:
-        m.roughness = if m.roughness.is_nan() || m.roughness < 0.0 { 1.0 } else { m.roughness };
-        m.metallic = if m.metallic.is_nan() || m.metallic < 0.0 { 0.0 } else { m.metallic };
+        m.roughness = if m.roughness.is_nan() || m.roughness < 0.0 {
+            1.0
+        } else {
+            m.roughness
+        };
+        m.metallic = if m.metallic.is_nan() || m.metallic < 0.0 {
+            0.0
+        } else {
+            m.metallic
+        };
 
         // alphaMode MASK → alpha-cutout. BLEND (true transparency) is not
         // supported by the integrator yet: refuse to silently mis-render.
@@ -330,14 +359,17 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
             }
         }
     }
-    let (role_normal, map_normal) = build_role_scaled(&scene.textures, &raw_used_normal, &normal_scales);
+    let (role_normal, map_normal) =
+        build_role_scaled(&scene.textures, &raw_used_normal, &normal_scales);
 
     // Remap each material's raw glTF texture index through the role map
     // (maps are indexed by *master texture id*, which is what `raw` holds).
     for p in &mut pending {
         p.material.albedo_texture = p.albedo.and_then(|i| map_albedo.get(i).copied().flatten());
         p.material.roughness_texture = p.mr.and_then(|i| map_mr.get(i).copied().flatten());
-        p.material.emissive_texture = p.emissive.and_then(|i| map_emissive.get(i).copied().flatten());
+        p.material.emissive_texture = p
+            .emissive
+            .and_then(|i| map_emissive.get(i).copied().flatten());
         p.material.normal_texture = p.normal.and_then(|i| map_normal.get(i).copied().flatten());
     }
 
@@ -426,7 +458,12 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
     }
 
     if scene.lights.is_empty() {
-        scene.lights.push(Light::Environment { texture: None, intensity: 1.0 });
+        // Default procedural sky, matching the WGSL gradient in gather.wgsl.
+        scene.lights.push(Light::Environment {
+            color_zenith: Vec3::new(0.55, 0.6, 0.75),
+            color_horizon: Vec3::new(0.95, 0.93, 0.9),
+            intensity: 1.0,
+        });
     }
 
     Ok(scene)
@@ -444,10 +481,7 @@ fn bake_primitive(
 ) -> Option<Mesh> {
     let reader = primitive.reader(|buf| Some(&buffers[buf.index()]));
 
-    let positions: Vec<Vec3> = reader
-        .read_positions()?
-        .map(Vec3::from_array)
-        .collect();
+    let positions: Vec<Vec3> = reader.read_positions()?.map(Vec3::from_array).collect();
     if positions.is_empty() {
         return None;
     }
@@ -512,7 +546,13 @@ fn bake_primitive(
                 acc[c] += n;
             }
             acc.into_iter()
-                .map(|n| if n.length_squared() > 1e-12 { n.normalize() } else { Vec3::Y })
+                .map(|n| {
+                    if n.length_squared() > 1e-12 {
+                        n.normalize()
+                    } else {
+                        Vec3::Y
+                    }
+                })
                 .collect()
         }
     };
@@ -537,7 +577,11 @@ fn bake_primitive(
         .iter()
         .map(|n| {
             let t = normal_mat.transform_vector3(*n);
-            if t.length_squared() > 1e-12 { t.normalize() } else { *n }
+            if t.length_squared() > 1e-12 {
+                t.normalize()
+            } else {
+                *n
+            }
         })
         .collect();
 
@@ -555,8 +599,80 @@ fn bake_primitive(
     let material_id = primitive
         .material()
         .index()
-        .map_or(materials.len().saturating_sub(1), |i| i.min(materials.len().saturating_sub(1)));
+        .map_or(materials.len().saturating_sub(1), |i| {
+            i.min(materials.len().saturating_sub(1))
+        });
 
-    Some(Mesh::new(transformed_pos, transformed_n, texcoords, indices, material_id))
+    Some(Mesh::new(
+        transformed_pos,
+        transformed_n,
+        texcoords,
+        indices,
+        material_id,
+    ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tex(w: u32, h: u32, color: [f32; 4]) -> Texture {
+        Texture {
+            width: w,
+            height: h,
+            data: vec![color; (w * h) as usize],
+        }
+    }
+
+    #[test]
+    fn srgb_decode_matches_gltf_spec() {
+        assert!((srgb_to_linear(0.0) - 0.0).abs() < 1e-6);
+        // 0.04045 is the spec's linear/sRGB crossover point.
+        assert!((srgb_to_linear(0.04045) - 0.0031308).abs() < 1e-4);
+        assert!((srgb_to_linear(1.0) - 1.0).abs() < 1e-6);
+        assert!((srgb_to_linear(0.5) - 0.21404114).abs() < 1e-5);
+    }
+
+    #[test]
+    fn build_role_compacts_dedups_and_decodes_srgb() {
+        let master = vec![
+            tex(2, 2, [0.5, 0.5, 0.5, 1.0]),
+            tex(2, 2, [1.0, 1.0, 1.0, 1.0]),
+        ];
+        let used: Vec<Option<usize>> = vec![Some(0), Some(1), Some(0)]; // 0 used twice
+        let (role, map) = build_role(&master, &used, true);
+        assert_eq!(role.len(), 2);
+        // sRGB-decoded: 0.5 -> ~0.214.
+        assert!((role[0].data[0][0] - 0.21404114).abs() < 1e-5);
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[1], Some(1));
+    }
+
+    #[test]
+    fn build_role_drops_mixed_sizes() {
+        let master = vec![
+            tex(2, 2, [0.5, 0.5, 0.5, 1.0]),
+            tex(4, 4, [0.5, 0.5, 0.5, 1.0]),
+        ];
+        let used = vec![Some(0), Some(1)];
+        let (role, map) = build_role(&master, &used, false);
+        // The 4x4 texture differs from the first (2x2) and is dropped.
+        assert_eq!(role.len(), 1);
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[1], None);
+    }
+
+    #[test]
+    fn build_role_scaled_bakes_normal_scale() {
+        let master = vec![tex(2, 2, [1.0, 0.5, 0.0, 1.0])];
+        let used = vec![Some(0)];
+        let scales = vec![2.0];
+        let (role, map) = build_role_scaled(&master, &used, &scales);
+        assert_eq!(map[0], Some(0));
+        // X and Y scaled by 2.0; Z and A untouched.
+        assert!((role[0].data[0][0] - 2.0).abs() < 1e-6);
+        assert!((role[0].data[0][1] - 1.0).abs() < 1e-6);
+        assert!((role[0].data[0][2] - 0.0).abs() < 1e-6);
+        assert_eq!(role[0].data[0][3], 1.0);
+    }
+}
