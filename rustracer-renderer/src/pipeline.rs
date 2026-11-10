@@ -109,6 +109,7 @@ pub fn create_tonemap_pipeline(
             storage_buffer_binding(0, false),
             storage_texture_binding(1, wgpu::StorageTextureAccess::WriteOnly, wgpu::TextureFormat::Rgba8Unorm),
             uniform_buffer_binding(2),
+            storage_buffer_binding(3, false),
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

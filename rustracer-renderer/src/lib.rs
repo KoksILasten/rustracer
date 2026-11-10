@@ -50,8 +50,8 @@ impl Default for RenderConfig {
             spp: 1,
             exposure: 1.0,
             gamma: 2.2,
-            light_emission: [20.0, 20.0, 20.0],
-            point_light_emission: [20.0, 20.0, 20.0],
+            light_emission: [1.0, 1.0, 1.0],
+            point_light_emission: [1.0, 1.0, 1.0],
             accumulate_frames: 0,
             enable_photon_map: false,
             enable_denoise: true,
@@ -102,6 +102,12 @@ pub struct ToneMapUniform {
     pub exposure: f32,
     pub gamma: f32,
     pub width: u32,
+    /// Gizmo brightness multiplier. Also the padding that puts `marker` on a
+    /// 16-byte boundary (f32, f32, u32, f32, vec4 = 32 bytes, matching WGSL).
+    pub glow: f32,
+    /// xy = gizmo centre in pixels, z = gizmo radius in pixels,
+    /// w = 1 when the gizmo should be drawn this frame.
+    pub marker: [f32; 4],
 }
 
 #[repr(C)]
@@ -186,7 +192,17 @@ pub struct Renderer {
     pub config: RenderConfig,
     pub buffers: GpuBuffers,
     sample_counter: u32,
-    first_frame_after_reset: bool,
+    /// Frames accumulated since the last reset. Drives the running-average
+    /// warm-up: alpha = 1/n for the first n frames, then 1/accumulate_frames.
+    frames_since_reset: u32,
+    /// Gizmo for the animated point light: (world position, world radius).
+    /// A point light has no geometry, so without this it is invisible and the
+    /// only way to find it is to hunt for the highlight it throws.
+    pub light_marker: Option<(glam::Vec3, f32)>,
+    /// Brightness of the gizmo, the user's "Light glow" slider.
+    pub light_glow: f32,
+    /// Latest camera, kept so the gizmo can be projected on the CPU.
+    camera: rustracer_core::camera::Camera,
     photon_trace_pipeline: wgpu::ComputePipeline,
     photon_count_pipeline: wgpu::ComputePipeline,
     photon_scatter_pipeline: wgpu::ComputePipeline,
@@ -305,6 +321,8 @@ impl Renderer {
                 exposure: 1.0,
                 gamma: 2.2,
                 width: config.width,
+                glow: 1.0,
+                marker: [0.0; 4],
             },
         );
         let img_params = buffer::UniformBuffer::new(
@@ -621,7 +639,10 @@ impl Renderer {
             config,
             buffers,
             sample_counter: 0,
-            first_frame_after_reset: true,
+            frames_since_reset: 0,
+            light_marker: None,
+            light_glow: 1.0,
+            camera: rustracer_core::camera::Camera::default(),
             photon_trace_pipeline,
             photon_count_pipeline,
             photon_scatter_pipeline,
@@ -649,14 +670,17 @@ impl Renderer {
     ) {
         // Increment frame counter for temporal noise
         self.sample_counter = self.sample_counter.wrapping_add(1);
-        // Force overwrite on first frame after reset to avoid flicker
-        let alpha = if self.first_frame_after_reset {
-            self.first_frame_after_reset = false;
+        // Running-average warm-up. A flat 1/N from the very first frame throws
+        // away most of the fresh frame's energy, and a flat 1.0 (what a
+        // per-frame reset used to give) never accumulates at all. Ramping
+        // 1, 1/2, 1/3 … 1/N is the actual running mean, so highlights build up
+        // from the first frame and the denoiser's variance estimate (which is
+        // scaled by alpha) starts strong and stands down as history grows.
+        self.frames_since_reset = self.frames_since_reset.saturating_add(1);
+        let alpha = if self.config.accumulate_frames == 0 {
             1.0
-        } else if self.config.accumulate_frames > 0 {
-            1.0 / self.config.accumulate_frames as f32
         } else {
-            1.0
+            1.0 / self.frames_since_reset.min(self.config.accumulate_frames) as f32
         };
         self.buffers.img_params.write(
             &self.queue,
@@ -677,12 +701,18 @@ impl Renderer {
                 _pad: [self.config.debug_view, 0, 0],
             },
         );
+        let marker = self
+            .light_marker
+            .map(|(pos, radius)| self.project_marker(pos, radius))
+            .unwrap_or([0.0; 4]);
         self.buffers.tonemap_params.write(
             &self.queue,
             &ToneMapUniform {
                 exposure: self.config.exposure,
                 gamma: self.config.gamma,
                 width: self.config.width,
+                glow: self.light_glow,
+                marker,
             },
         );
 
@@ -711,7 +741,11 @@ impl Renderer {
         // fresh frame (never the history buffer) also keeps the history
         // free of compounded smoothing bias.
         if self.config.enable_denoise {
-            for iter in 0..4usize {
+            // Two a-trous passes, not four: 5x5 kernels at steps 1/2/4/8 can
+            // pull detail from 30 px away, which smears the visor's
+            // reflections. Steps 1 and 2 keep the filter local; the ping-pong
+            // must stay even so the result lands in the buffer composite reads.
+            for iter in 0..2usize {
                 let step = 1u32 << iter;
                 self.buffers.denoise_params[iter].write(
                     &self.queue,
@@ -817,8 +851,43 @@ impl Renderer {
     }
 
     pub fn update_camera(&mut self, camera: &rustracer_core::camera::Camera) {
+        self.camera = camera.clone();
         let uniform = camera.to_uniform(self.config.width, self.config.height);
         self.buffers.camera.write(&self.queue, &uniform);
+    }
+
+    /// Project a world-space sphere to `(x_px, y_px, radius_px, camera_dist)`,
+    /// the format the tonemap pass expects for its light gizmo. The fourth
+    /// component doubles as the draw flag (0 = hidden) and as the depth the
+    /// tonemap pass compares against the scene's hit distance, so the ball is
+    /// correctly hidden behind geometry. Done on the CPU because there is no
+    /// writeable camera uniform for the splice pass.
+    fn project_marker(&self, world: glam::Vec3, radius: f32) -> [f32; 4] {
+        let cam = &self.camera;
+        let forward = (cam.look_at - cam.position).normalize_or_zero();
+        let right = forward.cross(cam.up).normalize_or_zero();
+        let up = right.cross(forward);
+        let v = world - cam.position;
+        let z = v.dot(forward);
+        if z <= cam.near.max(1e-4) {
+            return [0.0; 4];
+        }
+        let fov_scale = (cam.fov_degrees.to_radians() * 0.5).tan();
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let x_ndc = v.dot(right) / (z * fov_scale * aspect);
+        let y_ndc = v.dot(up) / (z * fov_scale);
+        // Off-screen: still flag it, the shader clips by pixel bounds anyway.
+        let visible = if x_ndc.abs() <= 1.5 && y_ndc.abs() <= 1.5 { v.length() } else { 0.0 };
+        let x_px = (x_ndc * 0.5 + 0.5) * self.config.width as f32;
+        let y_px = (0.5 - y_ndc * 0.5) * self.config.height as f32;
+        let radius_px = (radius / (z * fov_scale)) * (self.config.height as f32 * 0.5);
+        [x_px, y_px, radius_px.max(1.5), visible]
+    }
+
+    /// Re-upload the full light list (e.g. to animate a moving light).
+    pub fn update_lights(&self, lights: &[rustracer_core::scene::Light]) {
+        let raw: Vec<rustracer_core::scene::LightGpu> = lights.iter().map(light_to_gpu).collect();
+        self.buffers.lights.write(&self.queue, &raw);
     }
 
     pub fn reset_accumulation(&mut self) {
@@ -829,7 +898,14 @@ impl Renderer {
             num_pixels,
             wgpu::BufferUsages::STORAGE,
         );
-        self.first_frame_after_reset = true;
+        self.frames_since_reset = 0;
+    }
+
+    /// Force the next frame to overwrite the accumulation history (alpha = 1.0)
+    /// without reallocating the buffer. Used when the light animates every
+    /// frame, so EMA blending never smears the moving light.
+    pub fn reset_accumulation_soft(&mut self) {
+        self.frames_since_reset = 0;
     }
 
     /// Trace photons once and build the spatial hash grid.
@@ -1130,7 +1206,7 @@ impl GpuBuffers {
         ]
     }
 
-    fn tonemap_entries(&self) -> [wgpu::BindGroupEntry<'_>; 3] {
+    fn tonemap_entries(&self) -> [wgpu::BindGroupEntry<'_>; 4] {
         [
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -1143,6 +1219,10 @@ impl GpuBuffers {
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: self.tonemap_params.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self.gbuffer.buffer().as_entire_binding(),
             },
         ]
     }

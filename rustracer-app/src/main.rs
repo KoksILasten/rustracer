@@ -1,6 +1,9 @@
 //! Rustracer — GPU-accelerated photon mapping path tracer with egui UI.
 
+use anyhow::Context;
+use glam::Vec3;
 use rustracer_core::camera::Camera;
+use rustracer_core::scene::Light;
 use rustracer_renderer::{RenderConfig, Renderer};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,6 +73,21 @@ struct AppState {
     enable_denoise: bool,
     photon_debug: bool,
     photon_scale: f32,
+    // moving light
+    lights: Vec<Light>,
+    moving_light: bool,
+    moving_light_index: usize,
+    /// Radius (world units) of the glowing ball drawn where the moving light
+    /// is, so a light with no geometry can actually be seen.
+    light_size: f32,
+    /// How bright the gizmo ball glows.
+    light_glow: f32,
+    /// Multiplier on the orbit rate; 0 parks the light.
+    light_speed: f32,
+    /// Orbit angle in radians. Advanced by wall-clock time, not by frame count:
+    /// at 200 fps a per-frame step spun the light 4x faster than at 50 fps.
+    light_phase: f32,
+    last_frame: std::time::Instant,
     // fps counter
     fps: f32,
     frame_count: u64,
@@ -92,7 +110,7 @@ impl ApplicationHandler for RustracerApp {
         }
 
         let window_attrs = Window::default_attributes()
-            .with_title("Rustracer — Photon Mapper")
+            .with_title("Rustracer - Photon Mapper")
             .with_inner_size(winit::dpi::PhysicalSize::new(800, 600));
         let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
 
@@ -215,19 +233,23 @@ async fn init_app(
     instance: wgpu::Instance,
     scene_path: &PathBuf,
 ) -> anyhow::Result<AppState> {
-    let adapter = rustracer_renderer::device::select_adapter(&instance, Some(&surface)).await?;
+    let adapter = rustracer_renderer::device::select_adapter(&instance, Some(&surface))
+        .await
+        .context("selecting a GPU adapter")?;
 
     let size = window.inner_size();
     let width = size.width.max(1);
     let height = size.height.max(1);
 
     let spp = 4u32;
-    let light_emission = [25.0f32, 25.0, 25.0];
-    let point_light_emission = [25.0f32, 25.0, 25.0];
+    let light_emission = [1.0f32, 1.0, 1.0];
+    let point_light_emission = [1.0f32, 1.0, 1.0];
     let exposure = 1.0f32;
     let gamma = 2.2f32;
     let ambient = 0.03f32;
-    let accumulate_frames = 0u32;
+    // 0 would overwrite the history every frame (one frame of samples, forever);
+    // a non-zero value is what lets highlights actually converge.
+    let accumulate_frames = 32u32;
     let enable_photon_map = false;
     let enable_denoise = true;
     let photon_debug = false;
@@ -253,27 +275,42 @@ async fn init_app(
     };
 
     let mut scene = if scene_path.exists() {
-        rustracer_core::loader::load_gltf(scene_path)?
+        rustracer_core::loader::load_gltf(scene_path)
+            .with_context(|| format!("loading scene '{}'", scene_path.display()))?
+    } else if scene_path.to_str() == Some("dark-room") {
+        rustracer_core::scene::Scene::dark_room()
     } else {
         tracing::warn!(
-            "Scene '{}' not found, using test Cornell box",
+            "Scene '{}' not found, using test Cornell box (or pass 'dark-room')",
             scene_path.display()
         );
-        create_test_scene()
+        rustracer_core::scene::Scene::cornell_box()
     };
 
     // Optional scene.toml next to the glTF overrides materials and lights.
     let descriptor_path = scene_path.with_file_name("scene.toml");
     if descriptor_path.exists() {
-        let toml_str = std::fs::read_to_string(&descriptor_path)?;
+        let toml_str = std::fs::read_to_string(&descriptor_path)
+            .with_context(|| format!("reading '{}'", descriptor_path.display()))?;
         let descriptor = rustracer_core::config::parse_descriptor(&toml_str)?;
         rustracer_core::config::apply_descriptor(&mut scene, &descriptor);
         tracing::info!("Applied {}", descriptor_path.display());
     }
 
+    // A moving point light (orbit around the box center), toggled in the UI.
+    // Pushed last so its index is `scene.lights.len()`.
+    let moving_light_index = scene.lights.len();
+    scene.lights.push(Light::Point {
+        position: Vec3::new(0.8, 1.2, 0.0),
+        color: Vec3::new(1.0, 0.5, 0.15),
+        intensity: 40.0,
+    });
+
     let camera = Camera::frame_scene(&scene);
 
-    let mut renderer = Renderer::new(&adapter, render_config, &scene).await?;
+    let mut renderer = Renderer::new(&adapter, render_config, &scene)
+        .await
+        .context("initializing the renderer")?;
     renderer.update_camera(&camera);
     // Build the photon grid once at startup (trace-once)
     if renderer.config.enable_photon_map {
@@ -305,6 +342,14 @@ async fn init_app(
     let egui_renderer =
         egui_wgpu::Renderer::new(&renderer.device, surface_config.format, None, 1, false);
 
+    // Scene-relative light gizmo: a fixed world radius would be invisible on a
+    // large model and cartoonishly big on a small one.
+    let scene_diag = scene
+        .bounds()
+        .map(|(lo, hi)| (hi - lo).length())
+        .unwrap_or(1.0)
+        .max(1e-3);
+
     Ok(AppState {
         window,
         surface,
@@ -329,11 +374,27 @@ async fn init_app(
         enable_denoise,
         photon_debug,
         photon_scale,
+        lights: scene.lights.clone(),
+        moving_light: true,
+        moving_light_index,
+        light_size: scene_diag * 0.045,
+        light_glow: 1.0,
+        light_speed: 1.0,
+        light_phase: 0.0,
+        last_frame: std::time::Instant::now(),
         frame_count: 0,
         fps: 0.0,
         fps_timer: std::time::Instant::now(),
     })
 }
+
+/// EMA length used while the moving light is in flight. The user's Accum.
+/// Frames budget applies to a parked light (where the history can grow and the
+/// image converges); a moving light needs a short history, or the running mean
+/// smears illumination from where the light used to be. 24 frames at 4 spp is
+/// ~96 samples: enough to settle the highlights, while over that window the
+/// light travels roughly a third of its own diameter, so nothing visibly trails.
+const MOVING_HISTORY: u32 = 24;
 
 fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
     // FPS counter
@@ -343,6 +404,66 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
         tracing::info!("FPS: {:.1}", state.fps);
         state.frame_count = 0;
         state.fps_timer = std::time::Instant::now();
+    }
+
+    // Animate the moving point light (orbit around the box center). Two things
+    // matter here:
+    //
+    // * The light moves smoothly, every frame. Quantising its motion into steps
+    //   (or holding it still between steps) reads as jumping on screen, which is
+    //   worse than a little noise.
+    // * The accumulation history is an EMA whose length is capped while the
+    //   light moves. A long history of *different* light positions ghosts, so the
+    //   moving case forgets fast (MOVING_HISTORY frames -- a fraction of the
+    //   light's own diameter travelled, so no visible smear) and still averages
+    //   enough samples to keep highlights quiet. A parked light keeps the user's
+    //   full budget and converges properly.
+    let now = std::time::Instant::now();
+    let dt = now
+        .duration_since(state.last_frame)
+        .as_secs_f32()
+        .clamp(0.0, 0.1);
+    state.last_frame = now;
+    const ORBIT_RATE: f32 = 0.7; // radians per second at speed 1.0
+    if state.moving_light {
+        state.light_phase = (state.light_phase + dt * state.light_speed * ORBIT_RATE) % std::f32::consts::TAU;
+        let t = state.light_phase;
+        let target = Vec3::new(0.8 * t.cos(), 1.2, 0.8 * t.sin());
+        let parked = state.light_speed.abs() < 1e-3;
+        if let Some(Light::Point { position, .. }) = state.lights.get_mut(state.moving_light_index)
+        {
+            if !parked {
+                *position = target;
+            }
+        }
+        // Swap the history budget when the light starts or stops moving. The
+        // reset is what stops the parked image from inheriting the moving EMA.
+        let budget = if parked {
+            state.accumulate_frames
+        } else {
+            MOVING_HISTORY.min(state.accumulate_frames.max(1))
+        };
+        if state.renderer.config.accumulate_frames != budget {
+            state.renderer.config.accumulate_frames = budget;
+            state.renderer.reset_accumulation_soft();
+        }
+        if !parked {
+            state.renderer.update_lights(&state.lights);
+        }
+        let marker = match state.lights.get(state.moving_light_index) {
+            Some(Light::Point { position, .. }) => Some((*position, state.light_size)),
+            _ => None,
+        };
+        state.renderer.light_marker = marker;
+        state.renderer.light_glow = state.light_glow;
+    } else {
+        state.renderer.light_marker = None;
+        // Hand the accumulation budget back to the user's knob: the cap above
+        // only exists because a *moving* light cannot afford a long history.
+        if state.renderer.config.accumulate_frames != state.accumulate_frames {
+            state.renderer.config.accumulate_frames = state.accumulate_frames;
+            state.renderer.reset_accumulation_soft();
+        }
     }
 
     let output = match state.surface.get_current_texture() {
@@ -468,13 +589,24 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                         state.renderer.config.accumulate_frames = state.accumulate_frames;
                     }
                 });
+                if state.moving_light && state.light_speed.abs() > 1e-3 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "history is {} frames while the light is moving",
+                            MOVING_HISTORY.min(state.accumulate_frames.max(1))
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.label("Ambient:");
                     if ui
-                        .add(egui::Slider::new(&mut state.ambient, 0.0..=0.5))
+                        .add(egui::Slider::new(&mut state.ambient, 0.0..=2.0))
                         .changed()
                     {
                         state.renderer.config.ambient = state.ambient;
+                        state.renderer.reset_accumulation();
                     }
                 });
 
@@ -482,13 +614,13 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                 ui.label("Area Light (RGB):");
                 let mut changed = false;
                 changed |= ui
-                    .add(egui::Slider::new(&mut state.light_emission[0], 0.0..=200.0).text("R"))
+                    .add(egui::Slider::new(&mut state.light_emission[0], 0.0..=5.0).text("R"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut state.light_emission[1], 0.0..=200.0).text("G"))
+                    .add(egui::Slider::new(&mut state.light_emission[1], 0.0..=5.0).text("G"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut state.light_emission[2], 0.0..=200.0).text("B"))
+                    .add(egui::Slider::new(&mut state.light_emission[2], 0.0..=5.0).text("B"))
                     .changed();
                 if changed {
                     state.renderer.config.light_emission = state.light_emission;
@@ -498,25 +630,48 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                 let mut changed = false;
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut state.point_light_emission[0], 0.0..=200.0)
+                        egui::Slider::new(&mut state.point_light_emission[0], 0.0..=5.0)
                             .text("R"),
                     )
                     .changed();
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut state.point_light_emission[1], 0.0..=200.0)
+                        egui::Slider::new(&mut state.point_light_emission[1], 0.0..=5.0)
                             .text("G"),
                     )
                     .changed();
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut state.point_light_emission[2], 0.0..=200.0)
+                        egui::Slider::new(&mut state.point_light_emission[2], 0.0..=5.0)
                             .text("B"),
                     )
                     .changed();
                 if changed {
                     state.renderer.config.point_light_emission = state.point_light_emission;
                     state.renderer.reset_accumulation();
+                }
+                if ui
+                    .checkbox(&mut state.moving_light, "Moving light")
+                    .changed()
+                {
+                    state.renderer.reset_accumulation();
+                }
+                if state.moving_light {
+                    ui.horizontal(|ui| {
+                        ui.label("Light size:");
+                        ui.add(
+                            egui::Slider::new(&mut state.light_size, 0.01..=0.50)
+                                .fixed_decimals(2),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Glow:");
+                        ui.add(egui::Slider::new(&mut state.light_glow, 0.1..=6.0).fixed_decimals(2));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Spin speed:");
+                        ui.add(egui::Slider::new(&mut state.light_speed, 0.0..=8.0).fixed_decimals(2));
+                    });
                 }
 
                 ui.separator();
@@ -527,14 +682,15 @@ fn render_frame(state: &mut AppState, _window_id: winit::window::WindowId) {
                     state.renderer.config.exposure = 1.0;
                     state.gamma = 2.2;
                     state.renderer.config.gamma = 2.2;
-                    state.light_emission = [25.0, 25.0, 25.0];
-                    state.renderer.config.light_emission = [25.0, 25.0, 25.0];
-                    state.point_light_emission = [25.0, 25.0, 25.0];
-                    state.renderer.config.point_light_emission = [25.0, 25.0, 25.0];
+                    state.light_emission = [1.0, 1.0, 1.0];
+                    state.renderer.config.light_emission = [1.0, 1.0, 1.0];
+                    state.point_light_emission = [1.0, 1.0, 1.0];
+                    state.renderer.config.point_light_emission = [1.0, 1.0, 1.0];
                     state.ambient = 0.03;
                     state.renderer.config.ambient = 0.03;
-                    state.accumulate_frames = 0;
-                    state.renderer.config.accumulate_frames = 0;
+                    state.light_phase = 0.0;
+                    state.accumulate_frames = 32;
+                    state.renderer.config.accumulate_frames = 32;
                     state.enable_photon_map = false;
                     state.renderer.config.enable_photon_map = false;
                     state.enable_denoise = true;
@@ -688,205 +844,3 @@ fn save_output(state: &AppState) {
     }
 }
 
-// ── Test scene: Cornell box with objects ──
-
-fn create_test_scene() -> rustracer_core::scene::Scene {
-    use glam::Vec3;
-    use rustracer_core::material::Material;
-    use rustracer_core::scene::{Light, Mesh, Scene};
-
-    let mut scene = Scene::default();
-
-    // Materials
-    scene
-        .materials
-        .push(Material::lambertian(Vec3::new(0.73, 0.73, 0.73))); // 0: white
-    scene
-        .materials
-        .push(Material::lambertian(Vec3::new(0.65, 0.05, 0.05))); // 1: red
-    scene
-        .materials
-        .push(Material::lambertian(Vec3::new(0.12, 0.45, 0.15))); // 2: green
-    scene
-        .materials
-        .push(Material::lambertian(Vec3::new(0.73, 0.73, 0.73))); // 3: white (back/ceiling)
-    scene
-        .materials
-        .push(Material::emissive(Vec3::new(25.0, 20.0, 14.0), 1.0)); // 4: warm light
-    scene
-        .materials
-        .push(Material::metal(Vec3::new(0.95, 0.64, 0.54), 0.1)); // 5: gold metal
-    scene.materials.push(Material::dielectric(1.5, Vec3::ONE)); // 6: glass
-    scene
-        .materials
-        .push(Material::lambertian(Vec3::new(0.1, 0.1, 0.7))); // 7: blue
-
-    // Cornell box walls
-    let floor = create_quad(
-        Vec3::new(-1.0, -1.0, 1.0),
-        Vec3::new(1.0, -1.0, 1.0),
-        Vec3::new(1.0, -1.0, -1.0),
-        Vec3::new(-1.0, -1.0, -1.0),
-    );
-    let ceiling = create_quad(
-        Vec3::new(-1.0, 2.0, -1.0),
-        Vec3::new(1.0, 2.0, -1.0),
-        Vec3::new(1.0, 2.0, 1.0),
-        Vec3::new(-1.0, 2.0, 1.0),
-    );
-    let back_w = create_quad(
-        Vec3::new(-1.0, -1.0, -1.0),
-        Vec3::new(1.0, -1.0, -1.0),
-        Vec3::new(1.0, 2.0, -1.0),
-        Vec3::new(-1.0, 2.0, -1.0),
-    );
-    let left_w = create_quad(
-        Vec3::new(-1.0, -1.0, 1.0),
-        Vec3::new(-1.0, -1.0, -1.0),
-        Vec3::new(-1.0, 2.0, -1.0),
-        Vec3::new(-1.0, 2.0, 1.0),
-    );
-    let right_w = create_quad(
-        Vec3::new(1.0, -1.0, -1.0),
-        Vec3::new(1.0, -1.0, 1.0),
-        Vec3::new(1.0, 2.0, 1.0),
-        Vec3::new(1.0, 2.0, -1.0),
-    );
-    let light_q = create_quad(
-        Vec3::new(-0.3, 1.99, -0.3),
-        Vec3::new(0.3, 1.99, -0.3),
-        Vec3::new(0.3, 1.99, 0.3),
-        Vec3::new(-0.3, 1.99, 0.3),
-    );
-
-    // Objects: tall box (right), short box (left)
-    let tall_box = create_cube(Vec3::new(0.3, -1.0, -0.4), Vec3::new(1.0, -0.4, 0.0), 0); // white
-    let short_box = create_cube(Vec3::new(-0.7, -1.0, 0.1), Vec3::new(-0.4, -0.8, 0.8), 0); // white
-    let gold_cube = create_cube(
-        Vec3::new(-0.2, -1.0, -0.7),
-        Vec3::new(-0.05, -0.65, -0.55),
-        5,
-    ); // gold metal
-    let glass_cube = create_cube(Vec3::new(0.5, -0.8, -0.7), Vec3::new(0.6, -0.5, -0.6), 6); // glass
-
-    // Push all quads as meshes
-    let walls = [floor, ceiling, back_w, left_w, right_w, light_q];
-    let wall_mats = [0, 0, 3, 1, 2, 4];
-    for (i, quad) in walls.iter().enumerate() {
-        scene.meshes.push(std::sync::Arc::new(Mesh::new(
-            quad.0.clone(),
-            quad.1.clone(),
-            quad.2.clone(),
-            quad.3.clone(),
-            wall_mats[i],
-        )));
-    }
-
-    // Push object quads
-    for (positions, normals, texcoords, indices, mat_id) in
-        [tall_box, short_box, gold_cube, glass_cube]
-            .iter()
-            .flatten()
-    {
-        scene.meshes.push(std::sync::Arc::new(Mesh::new(
-            positions.clone(),
-            normals.clone(),
-            texcoords.clone(),
-            indices.clone(),
-            *mat_id,
-        )));
-    }
-
-    scene.lights.push(Light::Area {
-        triangle_index: 10,
-        color: Vec3::new(25.0, 20.0, 14.0),
-        intensity: 1.0,
-    });
-    scene.lights.push(Light::Area {
-        triangle_index: 11,
-        color: Vec3::new(25.0, 20.0, 14.0),
-        intensity: 1.0,
-    });
-
-    scene
-}
-
-fn create_quad(
-    v0: glam::Vec3,
-    v1: glam::Vec3,
-    v2: glam::Vec3,
-    v3: glam::Vec3,
-) -> (Vec<glam::Vec3>, Vec<glam::Vec3>, Vec<glam::Vec2>, Vec<u32>) {
-    let positions = vec![v0, v1, v2, v3];
-    let normal = (v1 - v0).cross(v2 - v0).normalize();
-    let normals = vec![normal; 4];
-    let texcoords = vec![
-        glam::Vec2::new(0.0, 0.0),
-        glam::Vec2::new(1.0, 0.0),
-        glam::Vec2::new(1.0, 1.0),
-        glam::Vec2::new(0.0, 1.0),
-    ];
-    let indices = vec![0, 1, 2, 0, 2, 3];
-    (positions, normals, texcoords, indices)
-}
-
-/// Create a box from min to max. Returns 6 quads with the given material id.
-fn create_cube(
-    min: glam::Vec3,
-    max: glam::Vec3,
-    material_id: usize,
-) -> Vec<(
-    Vec<glam::Vec3>,
-    Vec<glam::Vec3>,
-    Vec<glam::Vec2>,
-    Vec<u32>,
-    usize,
-)> {
-    let lo = min;
-    let hi = max;
-    let faces: [(glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3); 6] = [
-        (
-            glam::Vec3::new(lo.x, lo.y, lo.z),
-            glam::Vec3::new(lo.x, hi.y, lo.z),
-            glam::Vec3::new(lo.x, hi.y, hi.z),
-            glam::Vec3::new(lo.x, lo.y, hi.z),
-        ), // -X
-        (
-            glam::Vec3::new(hi.x, lo.y, hi.z),
-            glam::Vec3::new(hi.x, hi.y, hi.z),
-            glam::Vec3::new(hi.x, hi.y, lo.z),
-            glam::Vec3::new(hi.x, lo.y, lo.z),
-        ), // +X
-        (
-            glam::Vec3::new(lo.x, lo.y, hi.z),
-            glam::Vec3::new(hi.x, lo.y, hi.z),
-            glam::Vec3::new(hi.x, lo.y, lo.z),
-            glam::Vec3::new(lo.x, lo.y, lo.z),
-        ), // -Y
-        (
-            glam::Vec3::new(lo.x, hi.y, lo.z),
-            glam::Vec3::new(hi.x, hi.y, lo.z),
-            glam::Vec3::new(hi.x, hi.y, hi.z),
-            glam::Vec3::new(lo.x, hi.y, hi.z),
-        ), // +Y
-        (
-            glam::Vec3::new(hi.x, lo.y, lo.z),
-            glam::Vec3::new(hi.x, hi.y, lo.z),
-            glam::Vec3::new(lo.x, hi.y, lo.z),
-            glam::Vec3::new(lo.x, lo.y, lo.z),
-        ), // -Z
-        (
-            glam::Vec3::new(lo.x, lo.y, hi.z),
-            glam::Vec3::new(lo.x, hi.y, hi.z),
-            glam::Vec3::new(hi.x, hi.y, hi.z),
-            glam::Vec3::new(hi.x, lo.y, hi.z),
-        ), // +Z
-    ];
-    faces
-        .into_iter()
-        .map(|(v0, v1, v2, v3)| {
-            let (p, n, t, i) = create_quad(v0, v1, v2, v3);
-            (p, n, t, i, material_id)
-        })
-        .collect()
-}

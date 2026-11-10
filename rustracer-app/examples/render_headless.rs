@@ -2,7 +2,15 @@
 //! save the tonemapped result as PNG. Used to reproduce visual bugs
 //! without a window.
 //!
-//! cargo run -p rustracer-app --example render_headless -- <scene.gltf> [frames]
+//! cargo run -p rustracer-app --example render_headless -- <scene.gltf> \
+//!     [frames] [out.png] [denoise] [app_like] [photons] [spp] [accum] \
+//!     [w] [h] [debug_view] [zoom] [yaw] [pitch] [raw_save]
+//!
+//! Pass `1` for the boolean slots. `app_like` mirrors the app's defaults
+//! (spp 4, 32-frame accumulation). `raw_save` writes the linear accumulation
+//! instead of the tonemapped image.
+
+mod common;
 
 use std::path::PathBuf;
 
@@ -27,7 +35,10 @@ fn main() -> anyhow::Result<()> {
     let accum_arg: u32 = std::env::args()
         .nth(8)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(if app_like { 0 } else { frames });
+        // 32: the app's own default (main.rs). Keeping 0 here made "app_like"
+        // overwrite history every frame while the app accumulated — the two
+        // disagreed, which is exactly the bug this flag exists to reproduce.
+        .unwrap_or(if app_like { 32 } else { frames });
     let w_arg: u32 = std::env::args()
         .nth(9)
         .and_then(|s| s.parse().ok())
@@ -54,7 +65,15 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(0.0);
     let raw_save = std::env::args().nth(15).map(|s| s == "1").unwrap_or(false);
 
-    let scene = rustracer_core::loader::load_gltf(PathBuf::from(&path))?;
+    let mut scene = rustracer_core::loader::load_gltf(PathBuf::from(&path))?;
+    // Honour the sibling scene.toml exactly like the app does, so headless
+    // renders can A/B environment and light overrides.
+    let desc_path = PathBuf::from(&path).with_file_name("scene.toml");
+    if desc_path.exists() {
+        let desc = rustracer_core::config::parse_descriptor(&std::fs::read_to_string(&desc_path)?)?;
+        rustracer_core::config::apply_descriptor(&mut scene, &desc);
+        println!("applied {}", desc_path.display());
+    }
     println!(
         "scene: {} meshes, {} mats, {} tris, roles a/mr/e/n = {}/{}/{}/{}",
         scene.meshes.len(),
@@ -117,51 +136,17 @@ fn main() -> anyhow::Result<()> {
     }
     renderer.device.poll(wgpu::Maintain::Wait);
 
-    // Read the accumulation buffer back.
-    let acc = &renderer.buffers.accumulation;
-    let size = (width * height) as u64 * 16;
-    let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging_readback"),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = renderer.device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(acc.buffer(), 0, &staging, 0, size);
-    renderer.queue.submit(Some(encoder.finish()));
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    renderer.device.poll(wgpu::Maintain::Wait);
-    rx.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let floats: &[f32] = bytemuck::cast_slice(&data);
+    // Read the accumulation buffer back and save (raw or tonemapped PNG).
+    let floats = common::read_accumulation(&renderer)?;
     if raw_save {
         // Raw f32 RGBA dump for precision-critical comparisons.
         let mut path = out.clone();
         path.push_str(".bin");
-        std::fs::write(&path, bytemuck::cast_slice::<f32, u8>(floats))?;
+        std::fs::write(&path, bytemuck::cast_slice::<f32, u8>(&floats))?;
         println!("saved raw {path}");
         return Ok(());
     }
-    let pixels: Vec<u8> = floats
-        .chunks_exact(4)
-        .flat_map(|c| {
-            let tr = (c[0] / (1.0 + c[0])).clamp(0.0, 1.0);
-            let tg = (c[1] / (1.0 + c[1])).clamp(0.0, 1.0);
-            let tb = (c[2] / (1.0 + c[2])).clamp(0.0, 1.0);
-            [
-                (tr.powf(1.0 / 2.2) * 255.0) as u8,
-                (tg.powf(1.0 / 2.2) * 255.0) as u8,
-                (tb.powf(1.0 / 2.2) * 255.0) as u8,
-                255u8,
-            ]
-        })
-        .collect();
-    image::save_buffer(&out, &pixels, width, height, image::ColorType::Rgba8)?;
+    common::save_png(&floats, width, height, &out)?;
     println!("saved {out}");
     Ok(())
 }

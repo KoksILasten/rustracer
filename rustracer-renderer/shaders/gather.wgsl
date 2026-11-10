@@ -106,7 +106,8 @@ fn shadowed(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
 // environment get a neutral studio-ish dome scaled by the env light.
 fn sky_color(dir: vec3<f32>, zenith: vec3<f32>, horizon: vec3<f32>, intensity: f32) -> vec3<f32> {
     let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(zenith, horizon, pow(t, 0.5)) * intensity;
+    // dir.y = +1 is straight up, so it must get the *zenith* colour.
+    return mix(horizon, zenith, pow(t, 0.5)) * intensity;
 }
 
 struct MatParams {
@@ -121,12 +122,13 @@ fn eval_material(mat: Material, uv: vec2<f32>) -> MatParams {
     var rough = mat.roughness;
     var metal = mat.metallic;
     if mat.tex_albedo != TEX_NONE {
-        albedo = textureSampleLevel(base_tex, tex_sampler, uv, i32(mat.tex_albedo), 0.0).rgb;
+        albedo = mat.albedo.rgb * textureSampleLevel(base_tex, tex_sampler, uv, i32(mat.tex_albedo), 0.0).rgb;
     }
     if mat.tex_mr != TEX_NONE {
         let mr = textureSampleLevel(mr_tex, tex_sampler, uv, i32(mat.tex_mr), 0.0);
-        rough = mr.g;   // metallic-roughness texture: G = roughness
-        metal = mr.b;   // B = metallic
+        // glTF: roughnessFactor/metallicFactor scale the texture channels.
+        rough = clamp(mat.roughness * mr.g, 0.0, 1.0);   // G = roughness
+        metal = clamp(mat.metallic * mr.b, 0.0, 1.0);    // B = metallic
     }
     return MatParams(albedo, rough, metal);
 }
@@ -138,11 +140,18 @@ fn emissive_at(mat: Material, uv: vec2<f32>) -> vec3<f32> {
     return mat.emissive;
 }
 
+// One sampled light: irradiance estimate + the direction it came from
+// (needed by the specular lobe, which is centred on the half vector).
+struct LightSample {
+    e: vec3<f32>,
+    wi: vec3<f32>,
+}
+
 // One-sample direct lighting over ALL lights (uniform pick). Returns the
 // incident irradiance (before the albedo/pi BRDF factor).
-fn direct_light(hp: vec3<f32>, sn: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f32> {
+fn direct_light(hp: vec3<f32>, sn: vec3<f32>, rng: ptr<function, Rng>) -> LightSample {
     let n = arrayLength(&lights);
-    if n == 0u { return vec3(0.0); }
+    if n == 0u { return LightSample(vec3(0.0), sn); }
     let li = u32(rng_f32(rng) * f32(n));
     let l = lights[li];
 
@@ -151,46 +160,99 @@ fn direct_light(hp: vec3<f32>, sn: vec3<f32>, rng: ptr<function, Rng>) -> vec3<f
         let r2 = dot(to, to);
         let r = sqrt(r2);
         let ld = to / r;
-        if dot(sn, ld) <= 0.0 { return vec3(0.0); }
-        if shadowed(hp + sn * 0.01, ld, r - 0.001) { return vec3(0.0); }
-        return l.color * l.intensity * max(dot(sn, ld), 0.0) / (r2 + 0.01) * f32(n);
+        if dot(sn, ld) <= 0.0 { return LightSample(vec3(0.0), ld); }
+        if shadowed(hp + sn * 0.01, ld, r - 0.001) { return LightSample(vec3(0.0), ld); }
+        return LightSample(l.color * l.intensity * vec3(img_params.pl_r, img_params.pl_g, img_params.pl_b) * max(dot(sn, ld), 0.0) / (r2 + 0.01) * f32(n), ld);
     } else if l.kind == 1u { // directional
         let ld = normalize(l.data.xyz);
         let ndl = dot(sn, ld);
-        if ndl <= 0.0 { return vec3(0.0); }
-        if shadowed(hp + sn * 0.01, ld, 1e30) { return vec3(0.0); }
-        return l.color * l.intensity * ndl * f32(n);
+        if ndl <= 0.0 { return LightSample(vec3(0.0), ld); }
+        if shadowed(hp + sn * 0.01, ld, 1e30) { return LightSample(vec3(0.0), ld); }
+        return LightSample(l.color * l.intensity * ndl * f32(n), ld);
     } else if l.kind == 2u { // area (emissive triangle)
         let tri = triangles[u32(l.data.x)];
+        let mat = materials[tri.material_id];
         // Uniform sample the triangle.
         let u1 = rng_f32(rng); let u2 = rng_f32(rng);
         let su = sqrt(u1);
         let u = 1.0 - su; let v = u2 * su; let w = 1.0 - u - v;
         let lp = tri.v0 * w + tri.v1 * u + tri.v2 * v;
+        // Per-texel emissive radiance: the stored light color (mat.emissive
+        // for loader lights, the user's override color for scene.toml lights)
+        // times the emissive texture at the sampled point, tinted by the UI's
+        // area-light color. Sampling the texture keeps amber glass amber and
+        // black texels black instead of one dim average color.
+        let uv = tri.uv0 * w + tri.uv1 * u + tri.uv2 * v;
+        var le = l.color;
+        if mat.tex_emissive != TEX_NONE {
+            le = le * textureSampleLevel(emissive_tex, tex_sampler, uv, i32(mat.tex_emissive), 0.0).rgb;
+        }
+        le = le * img_params.light_emission;
         let to = lp - hp;
         let r2 = dot(to, to);
         let r = sqrt(r2);
         let ld = to / r;
         let ndl = dot(sn, ld);
-        if ndl <= 0.0 { return vec3(0.0); }
+        if ndl <= 0.0 { return LightSample(vec3(0.0), ld); }
         // Geometric normal of the light triangle (front face only).
         let ln = get_triangle_normal(tri);
         let ndl_l = dot(ln, -ld);
-        if ndl_l <= 0.0 { return vec3(0.0); }
-        if shadowed(hp + sn * 0.01, ld, r - 0.001) { return vec3(0.0); }
+        if ndl_l <= 0.0 { return LightSample(vec3(0.0), ld); }
+        if shadowed(hp + sn * 0.01, ld, r - 0.001) { return LightSample(vec3(0.0), ld); }
         let area = 0.5 * length(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
-        return l.color * l.intensity * ndl * ndl_l * area * f32(n) / (r2 + 0.01);
+        return LightSample(le * l.intensity * ndl * ndl_l * area * f32(n) / (r2 + 0.01), ld);
     }
-    return vec3(0.0); // environment handled separately
+    return LightSample(vec3(0.0), sn); // environment handled separately
 }
 
-// Soft reflection for rough metals: blur the mirror direction by roughness.
-fn bounce_dir(rd: vec3<f32>, n: vec3<f32>, rough: f32, rng: ptr<function, Rng>) -> vec3<f32> {
-    let mirror = reflect(rd, n);
-    let blur = smoothstep(0.0, 1.0, rough);
-    if blur <= 0.001 { return mirror; }
-    let diff = sample_cosine_hemisphere(rng);
-    return normalize(mix(mirror, to_world(diff, n), blur));
+// ── GGX specular ────────────────────────────────────────────────────────
+// Smith-Schlick masking, k = a/2 (the direct-lighting form of Heitz).
+fn smith_g1(nd: f32, a: f32) -> f32 {
+    let k = a * 0.5;
+    return nd / (nd * (1.0 - k) + k);
+}
+
+// GGX specular BRDF for one light direction `wi` (microfacet D*F*G / (4 ndl ndv)).
+fn spec_ggx(wo: vec3<f32>, n: vec3<f32>, wi: vec3<f32>, a: f32, f0: vec3<f32>) -> vec3<f32> {
+    let ndl = dot(n, wi);
+    let ndv = dot(n, wo);
+    if ndl <= 0.0 || ndv <= 0.0 { return vec3(0.0); }
+    let h = normalize(wo + wi);
+    let ndh = max(dot(n, h), 0.0);
+    let a2 = a * a;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let D = a2 / (PI * dd * dd);
+    let F = fresnel_schlick(max(dot(wo, h), 0.0), f0);
+    return F * (D * smith_g1(ndl, a) * smith_g1(ndv, a) / (4.0 * ndl * ndv));
+}
+
+// Orthonormal basis with z = n (the VNDF routine below works in z-up space).
+fn basis_z(n: vec3<f32>) -> mat3x3<f32> {
+    let up = select(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), abs(n.y) < 0.999);
+    let t = normalize(cross(up, n));
+    return mat3x3<f32>(t, cross(n, t), n);
+}
+
+// GGX visible-normal-distribution sample (Heitz 2018 "Sampling the GGX
+// Distribution"). Samples the full micro-facet lobe of width `a`, so narrow
+// roughness gives a tight highlight and grazing angles stay single-scattered.
+fn sample_spec_dir(rd: vec3<f32>, n: vec3<f32>, a: f32, rng: ptr<function, Rng>) -> vec3<f32> {
+    let B = basis_z(n);
+    let v = transpose(B) * (-rd);            // outgoing dir in z-up local space
+    let vh = normalize(vec3(a * v.x, a * v.y, max(v.z, 1e-4)));
+    let l2 = vh.x * vh.x + vh.y * vh.y;
+    let t1 = select(vec3(1.0, 0.0, 0.0), vec3(-vh.y, vh.x, 0.0) * inverseSqrt(l2), l2 > 0.0);
+    let t2 = cross(vh, t1);
+    let r = sqrt(rng_f32(rng));
+    let phi = 2.0 * PI * rng_f32(rng);
+    let x = r * cos(phi);
+    let y = r * sin(phi);
+    let s = 0.5 * (1.0 + vh.z);
+    let yy = (1.0 - s) * sqrt(max(0.0, 1.0 - x * x)) + s * y;
+    let hh = x * t1 + yy * t2 + sqrt(max(0.0, 1.0 - x * x - yy * yy)) * vh;
+    let out = reflect(rd, B * normalize(hh));
+    // Grazing samples can land under the surface; fall back to the mirror ray.
+    return select(out, reflect(rd, n), dot(out, n) > 0.0);
 }
 
 @compute @workgroup_size(8, 8)
@@ -237,8 +299,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var b = 0u; b < 6u; b++) {
             let hit = trace_bvh(ro, rd);
             if hit.t >= INF {
-                // Background: environment dome.
-                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * sky_color(rd, env_color, env_horizon, env_intensity));
+                // Primary rays see black; bounce rays still see the dome, so it
+                // lights the object without showing up as a background.
+                if b > 0u {
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * sky_color(rd, env_color, env_horizon, env_intensity));
+                }
                 break;
             }
             let tr = triangles[hit.prim_id];
@@ -372,22 +437,36 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             // PBR conductor/dielectric: F0 = mix(0.04, albedo, metallic).
             let f0 = mix(vec3(0.04), albedo, vec3(metal));
-            let ct = abs(dot(rd, shn));
-            let fr = fresnel_schlick(ct, f0);
+            let wo = -rd;                                  // view dir, away from surface
+            let a = max(rough * rough, 1e-3);              // GGX alpha = roughness^2
+            let fr = fresnel_schlick(abs(dot(rd, shn)), f0);
             let diffuse_weight = (1.0 - metal) * albedo;
-            let spec_prob = clamp(max(max(fr.r, fr.g), fr.b), 0.0, 0.98);
+            // Choose the lobe in proportion to its energy so a pure metal never
+            // spends paths on an empty diffuse lobe. `dscale` and the specular
+            // weights below divide by the selection probability, which keeps the
+            // estimate unbiased (this is what makes glass and glints show up).
+            let sp = max(max(fr.r, fr.g), fr.b);
+            let dp = max(max(diffuse_weight.r, diffuse_weight.g), diffuse_weight.b);
+            let spec_prob = clamp(select(sp / (sp + dp), 0.5, sp + dp <= 0.0), 0.001, 0.999);
             let do_spec = rng_f32(&rng) < spec_prob;
+            let dscale = diffuse_weight / (1.0 - spec_prob);
 
             // Direct lighting on the diffuse path (irradiance * BRDF).
             if !do_spec {
-                var direct = direct_light(hp, shn, &rng);
+                let ls = direct_light(hp, shn, &rng);
                 // Environment hemisphere contribution (approximate irradiance).
-                if env_intensity > 0.0 && !do_spec {
-                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * sky_color(shn, env_color, env_horizon, env_intensity));
+                if env_intensity > 0.0 {
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * dscale * sky_color(shn, env_color, env_horizon, env_intensity));
                 }
-                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * direct / PI);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * dscale * ls.e / PI);
                 // Simple ambient term as a last-resort fill.
                 add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * albedo * img_params.ambient);
+            } else {
+                // Specular NEE: evaluate the GGX lobe toward one sampled light.
+                // Point/directional lights and emissive geometry glint only
+                // through this term — the bounce ray sees geometry and sky.
+                let ls = direct_light(hp, shn, &rng);
+                add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * spec_ggx(wo, shn, ls.wi, a, f0) * ls.e / spec_prob);
             }
 
             // Photon-map indirect (only on the diffuse path).
@@ -426,7 +505,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     }
                 }
                 if ph_hits > 0u {
-                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * diffuse_weight * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius));
+                    add_radiance(s, &col, &lum_sum, &lum2_sum, &sample_lum, thr * dscale * ph_sum * img_params.photon_scale / (PI * f32(ph_hits) * img_params.photon_radius * img_params.photon_radius));
                 }
                 if img_params.photon_debug == 1u {
                     let density = min(f32(ph_hits) / 64.0, 1.0);
@@ -436,15 +515,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             // Next bounce direction.
             if do_spec {
-                rd = bounce_dir(rd, shn, rough, &rng);
+                rd = sample_spec_dir(rd, shn, a, &rng);
                 ro = hp + shn * 0.001;
-                // Specular throughput: reflection * fresnel (approximate).
-                thr = thr * f0;
+                // VNDF weight: F(V·H) * G1(N·L) (visible-normal sampling already
+                // folds in the D*G2/(4 ndv) terms), divided by the pick prob.
+                let h = normalize(wo + rd);
+                let ndl = max(dot(shn, rd), 0.0);
+                thr = thr * fresnel_schlick(max(dot(wo, h), 0.0), f0) * smith_g1(ndl, a) / spec_prob;
             } else {
                 let local = sample_cosine_hemisphere(&rng);
                 rd = to_world(local, shn);
                 ro = hp + shn * 0.001;
-                thr = thr * diffuse_weight;
+                thr = thr * dscale;
                 // Photons replace the noisy multi-bounce.
                 if img_params.use_photons == 1u { break; }
             }

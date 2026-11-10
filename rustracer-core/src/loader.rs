@@ -229,6 +229,38 @@ fn build_role_scaled(
 // Main loader
 // ---------------------------------------------------------------------------
 
+/// Whether a triangle emits light: untextured emissives always do; textured
+/// emissives only do when the emissive texture at the triangle's centroid UV
+/// is bright enough (a mostly-black emissive mask must not create thousands
+/// of dead lights, while the glowing glass panes still become lights).
+fn triangle_emits(mesh: &Mesh, tri: usize, mat: &Material, scene: &Scene) -> bool {
+    let Some(layer) = mat.emissive_texture else {
+        return mat.emissive.length() > 1e-4;
+    };
+    let Some(tex) = scene.tex_emissive.get(layer) else {
+        return false;
+    };
+    let [i0, i1, i2] = mesh.triangle_indices(tri);
+    let uv0 = mesh.texcoords.get(i0 as usize).copied().unwrap_or(Vec2::ZERO);
+    let uv1 = mesh.texcoords.get(i1 as usize).copied().unwrap_or(Vec2::ZERO);
+    let uv2 = mesh.texcoords.get(i2 as usize).copied().unwrap_or(Vec2::ZERO);
+    let uv = (uv0 + uv1 + uv2) / 3.0;
+    let c = sample_nearest(tex, uv.x, uv.y);
+    c[0] * mat.emissive.x + c[1] * mat.emissive.y + c[2] * mat.emissive.z > 0.05
+}
+
+/// Nearest-neighbor texture sample (for emissive brightness checks).
+fn sample_nearest(tex: &Texture, u: f32, v: f32) -> [f32; 4] {
+    if tex.width == 0 || tex.height == 0 {
+        return [0.0; 4];
+    }
+    let u = u.fract().rem_euclid(1.0);
+    let v = v.fract().rem_euclid(1.0);
+    let x = ((u * tex.width as f32) as usize).min(tex.width as usize - 1);
+    let y = ((v * tex.height as f32) as usize).min(tex.height as usize - 1);
+    tex.data[y * tex.width as usize + x]
+}
+
 /// Load a glTF 2.0 scene from a file path.
 pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
     let (document, buffers, images) = gltf::import(path)?;
@@ -290,10 +322,13 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
             gltf::material::AlphaMode::Opaque => {}
             gltf::material::AlphaMode::Mask => m.alpha_cutout = true,
             gltf::material::AlphaMode::Blend => {
+                // shortcut: BLEND becomes solid glass — no alpha blending,
+                // absorption or thin-wall handling yet.
                 tracing::warn!(
-                    "Material {:?} uses alphaMode BLEND (transparency), which is not supported; rendering it opaque",
+                    "Material {:?} uses alphaMode BLEND; rendering it as solid dielectric glass",
                     mat.name()
                 );
+                m.kind = MaterialKind::Dielectric;
             }
         }
 
@@ -428,26 +463,19 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
     }
 
     // ── Area lights from emissive materials (world-space triangles) ──
+    // Only triangles whose emissive texture is bright enough to actually
+    // emit become lights; the shader samples the emissive texture per point,
+    // so the light color stays texture-accurate (amber glass glows, black
+    // metal does not).
     let mut tri_offset = 0u32;
     for mesh in &scene.meshes {
         if let Some(mat) = scene.materials.get(mesh.material_id) {
             if mat.emits_light() {
-                // Effective radiance: emissive factor * (average texture color or 1).
-                let tex_avg = mat.emissive_texture.and_then(|i| scene.tex_emissive.get(i));
-                let color = if let Some(tex) = tex_avg {
-                    let mut avg = Vec3::ZERO;
-                    for p in &tex.data {
-                        avg += Vec3::new(p[0], p[1], p[2]);
-                    }
-                    (avg / tex.data.len() as f32) * mat.emissive
-                } else {
-                    mat.emissive
-                };
-                if color.length() > 0.05 {
-                    for t in 0..mesh.triangle_count() {
+                for t in 0..mesh.triangle_count() {
+                    if triangle_emits(mesh, t, mat, &scene) {
                         scene.lights.push(Light::Area {
                             triangle_index: tri_offset + t as u32,
-                            color,
+                            color: mat.emissive,
                             intensity: 1.0,
                         });
                     }
@@ -457,7 +485,15 @@ pub fn load_gltf(path: impl AsRef<Path>) -> anyhow::Result<Scene> {
         tri_offset += mesh.triangle_count() as u32;
     }
 
-    if scene.lights.is_empty() {
+    // Metals and glass have no diffuse response: with no environment light
+    // they reflect black. Emissive geometry counts as lights, so gate on the
+    // absence of an Environment light rather than on `lights.is_empty()` —
+    // a scene.toml `[environment]` entry still overrides the default.
+    if !scene
+        .lights
+        .iter()
+        .any(|l| matches!(l, Light::Environment { .. }))
+    {
         // Default procedural sky, matching the WGSL gradient in gather.wgsl.
         scene.lights.push(Light::Environment {
             color_zenith: Vec3::new(0.55, 0.6, 0.75),
@@ -674,5 +710,41 @@ mod tests {
         assert!((role[0].data[0][1] - 1.0).abs() < 1e-6);
         assert!((role[0].data[0][2] - 0.0).abs() < 1e-6);
         assert_eq!(role[0].data[0][3], 1.0);
+    }
+
+    #[test]
+    fn triangle_emits_samples_the_emissive_texture() {
+        // 2x2 emissive texture, only the top-left texel is bright amber.
+        let bright = Texture {
+            width: 2,
+            height: 2,
+            data: vec![
+                [1.0, 0.5, 0.2, 1.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let mut scene = Scene::default();
+        scene.tex_emissive.push(bright);
+
+        let emissive = Material {
+            emissive: Vec3::ONE,
+            emissive_texture: Some(0),
+            ..Default::default()
+        };
+        // A triangle whose centroid UV sits on the bright texel.
+        let mesh = Mesh::new(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![Vec3::Z; 3],
+            vec![Vec2::ZERO; 3],
+            vec![0, 1, 2],
+            0,
+        );
+        assert!(triangle_emits(&mesh, 0, &emissive, &scene));
+
+        // An all-black emissive texture emits nothing.
+        scene.tex_emissive[0] = Texture { width: 2, height: 2, data: vec![[0.0; 4]; 4] };
+        assert!(!triangle_emits(&mesh, 0, &emissive, &scene));
     }
 }

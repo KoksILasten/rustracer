@@ -289,4 +289,217 @@ impl Scene {
     pub fn flatten_materials(&self) -> Vec<MaterialGpu> {
         self.materials.iter().map(|m| m.to_gpu()).collect()
     }
+
+    /// The classic Cornell box: colored walls, a warm ceiling light, and a
+    /// few objects (gold metal, glass). Used by the app when no glTF is
+    /// given, and by the `cornell` example to showcase color bleed.
+    pub fn cornell_box() -> Scene {
+        let mut scene = Scene::default();
+
+        // Materials
+        scene.materials.push(Material::lambertian(Vec3::new(0.73, 0.73, 0.73))); // 0: white
+        scene.materials.push(Material::lambertian(Vec3::new(0.65, 0.05, 0.05))); // 1: red
+        scene.materials.push(Material::lambertian(Vec3::new(0.12, 0.45, 0.15))); // 2: green
+        scene.materials.push(Material::lambertian(Vec3::new(0.73, 0.73, 0.73))); // 3: white (back/ceiling)
+        scene.materials.push(Material::emissive(Vec3::new(25.0, 20.0, 14.0), 1.0)); // 4: warm light
+        scene.materials.push(Material::metal(Vec3::new(0.95, 0.64, 0.54), 0.1)); // 5: gold metal
+        scene.materials.push(Material::dielectric(1.5, Vec3::ONE)); // 6: glass
+        scene.materials.push(Material::lambertian(Vec3::new(0.1, 0.1, 0.7))); // 7: blue
+
+        // Cornell box walls
+        let floor = create_quad(
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let ceiling = create_quad(
+            Vec3::new(-1.0, 2.0, -1.0),
+            Vec3::new(1.0, 2.0, -1.0),
+            Vec3::new(1.0, 2.0, 1.0),
+            Vec3::new(-1.0, 2.0, 1.0),
+        );
+        let back_w = create_quad(
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, 2.0, -1.0),
+            Vec3::new(-1.0, 2.0, -1.0),
+        );
+        let left_w = create_quad(
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 2.0, -1.0),
+            Vec3::new(-1.0, 2.0, 1.0),
+        );
+        let right_w = create_quad(
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(1.0, 2.0, 1.0),
+            Vec3::new(1.0, 2.0, -1.0),
+        );
+        let light_q = create_quad(
+            Vec3::new(-0.3, 1.99, -0.3),
+            Vec3::new(0.3, 1.99, -0.3),
+            Vec3::new(0.3, 1.99, 0.3),
+            Vec3::new(-0.3, 1.99, 0.3),
+        );
+
+        // Objects
+        let tall_box = create_cube(Vec3::new(0.3, -1.0, -0.4), Vec3::new(1.0, -0.4, 0.0), 0);
+        let short_box = create_cube(Vec3::new(-0.7, -1.0, 0.1), Vec3::new(-0.4, -0.8, 0.8), 0);
+        let gold_cube = create_cube(Vec3::new(-0.2, -1.0, -0.7), Vec3::new(-0.05, -0.65, -0.55), 5);
+        let glass_cube = create_cube(Vec3::new(0.5, -0.8, -0.7), Vec3::new(0.6, -0.5, -0.6), 6);
+
+        let walls = [floor, ceiling, back_w, left_w, right_w, light_q];
+        let wall_mats = [0, 0, 3, 1, 2, 4];
+        for (i, quad) in walls.iter().enumerate() {
+            scene.meshes.push(Arc::new(Mesh::new(
+                quad.0.clone(),
+                quad.1.clone(),
+                quad.2.clone(),
+                quad.3.clone(),
+                wall_mats[i],
+            )));
+        }
+        for (positions, normals, texcoords, indices, mat_id) in
+            [tall_box, short_box, gold_cube, glass_cube].iter().flatten()
+        {
+            scene.meshes.push(Arc::new(Mesh::new(
+                positions.clone(),
+                normals.clone(),
+                texcoords.clone(),
+                indices.clone(),
+                *mat_id,
+            )));
+        }
+
+        // Ceiling light quad = walls[5], its two triangles are 10 and 11.
+        scene.lights.push(Light::Area { triangle_index: 10, color: Vec3::new(25.0, 20.0, 14.0), intensity: 1.0 });
+        scene.lights.push(Light::Area { triangle_index: 11, color: Vec3::new(25.0, 20.0, 14.0), intensity: 1.0 });
+
+        scene
+    }
+
+    /// A dark room with a glossy tiled floor that mirrors a thin ceiling
+    /// light strip — a specular-reflection stress test. Front wall is left
+    /// open so the camera can look in.
+    pub fn dark_room() -> Scene {
+        let mut scene = Scene::default();
+
+        // Materials
+        scene.materials.push(Material::metal(Vec3::new(0.08, 0.08, 0.10), 0.07)); // 0: dark tile A (mirror)
+        scene.materials.push(Material::metal(Vec3::new(0.16, 0.16, 0.20), 0.20)); // 1: dark tile B (softer)
+        scene.materials.push(Material::lambertian(Vec3::new(0.03, 0.03, 0.04))); // 2: dark wall
+        scene.materials.push(Material::lambertian(Vec3::new(0.04, 0.04, 0.05))); // 3: ceiling
+        scene.materials.push(Material::emissive(Vec3::new(40.0, 36.0, 28.0), 1.0)); // 4: light strip
+
+        let half = 2.0; // floor is 4 x 4
+        let tile = 0.5;
+        let n = 8;
+
+        // Glossy tiled floor: an 8x8 checkerboard of two dark reflective metals.
+        for iz in 0..n {
+            for ix in 0..n {
+                let x0 = -half + ix as f32 * tile;
+                let z0 = -half + iz as f32 * tile;
+                let mat = if (ix + iz) % 2 == 0 { 0 } else { 1 };
+                let quad = create_quad(
+                    Vec3::new(x0, 0.0, z0 + tile),
+                    Vec3::new(x0 + tile, 0.0, z0 + tile),
+                    Vec3::new(x0 + tile, 0.0, z0),
+                    Vec3::new(x0, 0.0, z0),
+                );
+                scene.meshes.push(Arc::new(Mesh::new(quad.0, quad.1, quad.2, quad.3, mat)));
+            }
+        }
+
+        // Walls and ceiling (front left open for the camera).
+        let left = create_quad(
+            Vec3::new(-half, 0.0, half),
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(-half, 3.0, -half),
+            Vec3::new(-half, 3.0, half),
+        );
+        let right = create_quad(
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(half, 3.0, half),
+            Vec3::new(half, 3.0, -half),
+        );
+        let back = create_quad(
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 3.0, -half),
+            Vec3::new(-half, 3.0, -half),
+        );
+        let ceiling = create_quad(
+            Vec3::new(-half, 3.0, -half),
+            Vec3::new(half, 3.0, -half),
+            Vec3::new(half, 3.0, half),
+            Vec3::new(-half, 3.0, half),
+        );
+        for (q, mat) in [(left, 2), (right, 2), (back, 2), (ceiling, 3)] {
+            scene.meshes.push(Arc::new(Mesh::new(q.0, q.1, q.2, q.3, mat)));
+        }
+
+        // Thin emissive strip on the ceiling (the only light source).
+        let light_tri = scene.triangle_count() as u32;
+        let strip = create_quad(
+            Vec3::new(-1.5, 2.99, 0.15),
+            Vec3::new(1.5, 2.99, 0.15),
+            Vec3::new(1.5, 2.99, -0.15),
+            Vec3::new(-1.5, 2.99, -0.15),
+        );
+        scene.meshes.push(Arc::new(Mesh::new(strip.0, strip.1, strip.2, strip.3, 4)));
+
+        let light_color = Vec3::new(40.0, 36.0, 28.0);
+        scene.lights.push(Light::Area { triangle_index: light_tri, color: light_color, intensity: 1.0 });
+        scene.lights.push(Light::Area { triangle_index: light_tri + 1, color: light_color, intensity: 1.0 });
+
+        scene
+    }
+}
+
+fn create_quad(
+    v0: Vec3,
+    v1: Vec3,
+    v2: Vec3,
+    v3: Vec3,
+) -> (Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec<u32>) {
+    let positions = vec![v0, v1, v2, v3];
+    let normal = (v1 - v0).cross(v2 - v0).normalize();
+    let normals = vec![normal; 4];
+    let texcoords = vec![
+        Vec2::new(0.0, 0.0),
+        Vec2::new(1.0, 0.0),
+        Vec2::new(1.0, 1.0),
+        Vec2::new(0.0, 1.0),
+    ];
+    let indices = vec![0, 1, 2, 0, 2, 3];
+    (positions, normals, texcoords, indices)
+}
+
+/// Create a box from min to max. Returns 6 quads with the given material id.
+fn create_cube(
+    min: Vec3,
+    max: Vec3,
+    material_id: usize,
+) -> Vec<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec<u32>, usize)> {
+    let lo = min;
+    let hi = max;
+    let faces: [(Vec3, Vec3, Vec3, Vec3); 6] = [
+        (Vec3::new(lo.x, lo.y, lo.z), Vec3::new(lo.x, hi.y, lo.z), Vec3::new(lo.x, hi.y, hi.z), Vec3::new(lo.x, lo.y, hi.z)), // -X
+        (Vec3::new(hi.x, lo.y, hi.z), Vec3::new(hi.x, hi.y, hi.z), Vec3::new(hi.x, hi.y, lo.z), Vec3::new(hi.x, lo.y, lo.z)), // +X
+        (Vec3::new(lo.x, lo.y, hi.z), Vec3::new(hi.x, lo.y, hi.z), Vec3::new(hi.x, lo.y, lo.z), Vec3::new(lo.x, lo.y, lo.z)), // -Y
+        (Vec3::new(lo.x, hi.y, lo.z), Vec3::new(hi.x, hi.y, lo.z), Vec3::new(hi.x, hi.y, hi.z), Vec3::new(lo.x, hi.y, hi.z)), // +Y
+        (Vec3::new(hi.x, lo.y, lo.z), Vec3::new(hi.x, hi.y, lo.z), Vec3::new(lo.x, hi.y, lo.z), Vec3::new(lo.x, lo.y, lo.z)), // -Z
+        (Vec3::new(lo.x, lo.y, hi.z), Vec3::new(lo.x, hi.y, hi.z), Vec3::new(hi.x, hi.y, hi.z), Vec3::new(hi.x, lo.y, hi.z)), // +Z
+    ];
+    faces
+        .into_iter()
+        .map(|(v0, v1, v2, v3)| {
+            let (p, n, t, i) = create_quad(v0, v1, v2, v3);
+            (p, n, t, i, material_id)
+        })
+        .collect()
 }
