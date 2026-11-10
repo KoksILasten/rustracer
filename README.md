@@ -1,6 +1,6 @@
 # Rustracer - WIP
 
-<img width="796" height="628" alt="image" src="https://github.com/user-attachments/assets/7b868c42-c295-4feb-b27f-be2db17b1c91" />
+<img width="796" height="626" alt="image" src="https://github.com/user-attachments/assets/4533adf7-41a7-4e18-aad2-acea41f39d2c" />
 
 
 GPU-accelerated path tracer with photon mapping, written in Rust on wgpu.
